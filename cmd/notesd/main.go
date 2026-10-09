@@ -16,11 +16,8 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
+	"github.com/ryankupk/notes/internal/app"
 	"github.com/ryankupk/notes/internal/config"
-	"github.com/ryankupk/notes/internal/events"
-	"github.com/ryankupk/notes/internal/httpapi"
-	"github.com/ryankupk/notes/internal/note"
-	"github.com/ryankupk/notes/internal/store/mongostore"
 )
 
 const (
@@ -34,13 +31,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "notesd:", err)
 		os.Exit(1)
 	}
-}
-
-// mongoPinger adapts the driver client to httpapi.Pinger.
-type mongoPinger struct{ client *mongo.Client }
-
-func (p mongoPinger) Ping(ctx context.Context) error {
-	return p.client.Ping(ctx, readpref.Primary())
 }
 
 func run() error {
@@ -74,20 +64,16 @@ func run() error {
 	}
 	logger.Info("connected to mongo", "db", cfg.MongoDB)
 
-	store := mongostore.New(client.Database(cfg.MongoDB).Collection(cfg.NotesCollection))
 	indexCtx, cancelIndexes := context.WithTimeout(ctx, indexTimeout)
 	defer cancelIndexes()
-	if err := store.EnsureIndexes(indexCtx); err != nil {
+	service, err := app.New(indexCtx, client.Database(cfg.MongoDB).Collection(cfg.NotesCollection), logger)
+	if err != nil {
 		return err
 	}
 
-	hub := events.NewHub(events.DefaultBuffer)
-	notes := note.NewService(store, hub, nil, nil)
-
-	router := httpapi.NewRouter(httpapi.Deps{Pinger: mongoPinger{client}, Notes: notes, Hub: hub, Logger: logger})
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           router,
+		Handler:           service.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -106,6 +92,9 @@ func run() error {
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancelShutdown()
+	// Hijacked WebSocket connections are invisible to server.Shutdown, so close
+	// them (with 1001 Going Away) through the hub first.
+	service.Close()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutting down http server: %w", err)
 	}
