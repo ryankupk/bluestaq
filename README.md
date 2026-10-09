@@ -41,17 +41,17 @@ pnpm install
 pnpm dev                              # http://localhost:5173
 ```
 
-Open http://localhost:5173 in **two tabs**. Type a different name in each, for example `alice` and `bob`, and press Enter. Each tab now acts as a separate user: pressing Enter fetches a signed token for that name from the dev-mode token endpoint, and every request after that is authenticated. The Vite dev server proxies `/api`, including the WebSocket, to `:8080`, so the browser only ever talks to one origin and the demo needs no CORS configuration. That also holds when you open it from another machine (`pnpm dev --host`, then `http://<server-ip>:5173`).
+Open http://localhost:5173 in **two tabs**. Type a different name in each, for example `Alice` and `Bob`, and press Enter. Each tab now acts as a separate user: pressing Enter fetches a signed token for that name from the dev-mode token endpoint, and every request after that is authenticated. The Vite dev server proxies `/api`, including the WebSocket, to `:8080`, so the browser only ever talks to one origin and the demo needs no CORS configuration. That also holds when you open it from another machine (`pnpm dev --host`, then `http://<server-ip>:5173`).
 
 **Walkthrough.** Each step shows one piece of the server:
 
-1. **Live updates.** In alice's tab, click "+ New note" and give it a path such as `eng/runbooks/deploy.md`. It appears in bob's list without a refresh. The service publishes a `note.created` event to the in-process hub after the write succeeds (`internal/note/service.go`, `internal/events/hub.go`), and the WebSocket handler pushes it to every subscriber (`internal/httpapi/ws.go`).
+1. **Live updates.** In Alice's tab, click "+ New note" and give it a path such as `eng/runbooks/deploy.md`. It appears in Bob's list without a refresh. The service publishes a `note.created` event to the in-process hub after the write succeeds (`internal/note/service.go`, `internal/events/hub.go`), and the WebSocket handler pushes it to every subscriber (`internal/httpapi/ws.go`).
 
-2. **Live editing and presence.** Open the note in both tabs and type in alice's. Bob's list shows "✎ alice", and bob's editor follows along as she types. The editing badge is an ephemeral `editing` message: relayed to everyone except the sender, never stored, and cleared after a few idle seconds, a note switch, or a closed tab. The live text comes from autosave. The client sends an ordinary versioned `PUT` shortly after each pause in typing, one at a time, and every other tab reloads the note when the resulting `note.updated` event arrives. This is not true collaborative editing: there is no keystroke merging (see "What I'd change").
+2. **Live editing and presence.** Open the note in both tabs and type in Alice's tab. Bob's list shows "✎ Alice", and Bob's editor follows along as she types. The editing badge is an ephemeral `editing` message: relayed to everyone except the sender, never stored, and cleared after a few idle seconds, a note switch, or a closed tab. The live text comes from autosave. The client sends an ordinary versioned `PUT` shortly after each pause in typing, one at a time, and every other tab reloads the note when the resulting `note.updated` event arrives.
 
-3. **Concurrent edits are detected, not lost.** Untick **Autosave** in bob's tab, which brings back a Save button, and type something. Then type in alice's tab, which still autosaves. Bob's text is left alone, and he sees "updated by alice, your save will conflict". When bob clicks Save, the server rejects it with **412** because his `If-Match` version is stale. That check and the write happen in one atomic MongoDB `findOneAndUpdate` (`internal/store/mongostore/mongostore.go`, `compareAndSet`). The 412 response carries alice's current note, so the banner can say who saved which version without an extra request.
+3. **Concurrent edits are detected, not lost.** Untick **Autosave** in Bob's tab, which brings back a Save button, and type something. Then type in Alice's tab, which still autosaves. Bob's text is left alone, and he sees "updated by Alice, your save will conflict". When Bob clicks Save, the server rejects it with **412** because his `If-Match` version is stale. That check and the write happen in one atomic MongoDB `findOneAndUpdate` (`internal/store/mongostore/mongostore.go`, `compareAndSet`). The 412 response carries Alice's current note, so the banner can say who saved which version without an extra request.
 
-4. **Resolving it.** Bob chooses "Load their version" (take alice's text) or "Overwrite with mine" (re-save his text against alice's version). Both are ordinary REST calls. The server never guesses which edit should win; see design choice 1 below.
+4. **Resolving it.** Bob chooses "Load their version" (take Alice's text) or "Overwrite with mine" (re-save his text against Alice's version). Both are ordinary REST calls. The server never guesses which edit should win; see design choice 1 below.
 
 5. **Reconnect.** Stop the backend (`docker compose stop app`) and the status dot turns to "reconnecting…". Start it again (`docker compose start app`): the client reconnects with backoff and refetches the list.
 
@@ -99,7 +99,7 @@ The tests come in three layers:
 
 **Contract (e2e) tests** (`test/e2e`) build the production wiring (`internal/app`, which `cmd/notesd` also uses) against a throwaway MongoDB database. They talk to it only over HTTP and a real WebSocket client. Scenarios include a two-writer conflict, rename and path collision, pagination, reconnect catch-up, and presence between two clients.
 
-Mongo-backed tests skip with a message when `MONGO_URI` is unset. The Makefile defaults it to the compose instance. `make cover` measures `./internal/...` across all test layers together; it's about 90% at the time of writing.
+Mongo-backed tests skip with a message when `MONGO_URI` is unset. The Makefile defaults it to the compose instance. `make cover` measures `./internal/...` across all test layers together: it's about 90% at the time of writing.
 
 ## API
 
@@ -108,7 +108,7 @@ Base path `/api/v1`. Every route except `/healthz` (and the dev token endpoint) 
 | Method & path | Purpose | Notes |
 |---|---|---|
 | `GET /healthz` | Liveness and database ping | Public; 200 or 503 |
-| `POST /auth/dev-token` | Sign in by name: `{"user":"alice"}` gives `{token, user, expiresAt}` | **Dev mode only**; 404 in `jwt` mode |
+| `POST /auth/dev-token` | Sign in by name: `{"user":"Alice"}` gives `{token, user, expiresAt}` | **Dev mode only**; 404 in `jwt` mode |
 | `POST /notes` | Create `{path, body, tags}` | 201, `ETag`, `Location`; 409 if the path is taken |
 | `GET /notes` | List / search / sync | `prefix`, `tag`, `q`, `updatedSince`, `includeDeleted`, `limit` (≤200), `cursor`, `fields=body` |
 | `GET /notes/:id` | Read one note | `ETag`; `If-None-Match` gives 304 |
@@ -117,11 +117,13 @@ Base path `/api/v1`. Every route except `/healthz` (and the dev token endpoint) 
 | `GET /folders?prefix=eng/` | Immediate child folders with note counts | Drives a file-tree UI |
 | `GET /ws?prefix=eng/&access_token=…` | WebSocket event stream | See below |
 
-Status codes: 401 for a missing, invalid or expired token, 400 for invalid input, 404 when the note is missing or deleted, 409 when the path is taken, 412 for a stale `If-Match` (the body includes `current`, the latest note, and `ETag` carries its version), 413 for a body over 1 MiB, and 428 when `If-Match` is missing.
+Status codes: 401 for a missing, invalid or expired token, 400 for invalid input, 404 when the note is missing or deleted, 409 when the path is taken, 412 for a stale `If-Match` (the body includes `current`, the latest note, and `ETag` carries its version), 413 for a request body over 1 MiB, and 428 when `If-Match` is missing. Because the 1 MiB limit applies to the JSON request, and JSON escapes newlines and quotes, the practical maximum note size is somewhat under 1 MiB.
+
+Responses over 1 KB are gzip-compressed for clients that accept it. Real Markdown shrinks about 2.4× (measured on this README), which matters most when every viewer refetches a large note after a live update.
 
 ```sh
 # Sign in (dev mode). In fish: set TOKEN (curl ... | string match -rg '"token":"([^"]+)"')
-TOKEN=$(curl -s -XPOST localhost:8080/api/v1/auth/dev-token -d '{"user":"alice"}' | sed -E 's/.*"token":"([^"]+)".*/\1/')
+TOKEN=$(curl -s -XPOST localhost:8080/api/v1/auth/dev-token -d '{"user":"Alice"}' | sed -E 's/.*"token":"([^"]+)".*/\1/')
 AUTH="Authorization: Bearer $TOKEN"
 
 # Create
@@ -162,8 +164,8 @@ Clients may send `{"type":"editing","noteId":"..."}` and `{"type":"stopped","not
 **Scope:** this is authentication only. Any signed-in user can read and write every note; per-folder authorization is future work.
 
 ```json
-{"type":"note.updated","note":{"id":"…","path":"eng/runbooks/deploy.md","title":"deploy.md","version":2,"tags":["ops"],"deleted":false,"updatedAt":"…","updatedBy":"bob"}}
-{"type":"presence","presence":{"noteId":"…","path":"eng/runbooks/deploy.md","user":"alice","state":"editing","at":"…"}}
+{"type":"note.updated","note":{"id":"…","path":"eng/runbooks/deploy.md","title":"deploy.md","version":2,"tags":["ops"],"deleted":false,"updatedAt":"…","updatedBy":"Bob"}}
+{"type":"presence","presence":{"noteId":"…","path":"eng/runbooks/deploy.md","user":"Alice","state":"editing","at":"…"}}
 ```
 
 ## Layout
@@ -229,7 +231,15 @@ The hub lives in memory inside one process. That was a conscious tradeoff: it's 
 
 **Attachments.** Images and PDFs belong in object storage, with only references kept in notes.
 
-**Stop doing:** asking every client to send the full note body on `PUT`. For large notes, a `PATCH` with a text diff would cut bandwidth. It only becomes worth its complexity alongside the merge work above.
+**Incremental saves (stop sending the whole note).** Today every save uploads the full body, and every viewer then downloads the full body again, because live events say *that* a note changed, not *how*. With autosave, a 900 KB note and three viewers move about 3.6 MB per pause in typing, where the actual edit might be a few hundred bytes. The fix:
+
+- **`PATCH /notes/:id`** with a text-edit format named by its `Content-Type`, for example `[{"at": 1200, "delete": 5, "insert": "new"}]` against the base version. `PUT` stays as the simple whole-note option, so clients can use either. JSON Patch (RFC 6902) doesn't fit, because it edits JSON fields, not text inside a string.
+
+- **Exact diffs, thanks to versioning.** Diffs usually need fuzzy matching, because the server's text may not be what the client diffed against. Here `If-Match` already pins the base version: the server either has exactly that version or answers 412. So patches apply exactly, and the write keeps the same atomic compare-and-set as `PUT`.
+
+- **Diffs in live events.** `note.updated` would carry the same small patch, and viewers on the base version apply it locally instead of refetching. Anyone on another version falls back to a full `GET`. This direction is the bigger win, since it scales with the number of viewers.
+
+- **What it doesn't change:** MongoDB still rewrites the whole document on disk on each save. Diffs cut network traffic, not storage writes. They would also lift the practical size ceiling, which today is the 1 MiB request limit.
 
 ## Alternatives considered
 
@@ -258,4 +268,5 @@ Write README: running, testing, API, design choices, tradeoffs, future work
 Add minimal React demo client for live updates and conflict handling
 Demo client: serialized autosave with a manual-save toggle for showing conflicts
 Add JWT authentication with a dev-mode token endpoint, and CORS with a matching WebSocket origin check
+Gzip responses over 1 KB; document incremental saves as future work
 ```

@@ -43,6 +43,7 @@ type Deps struct {
 const (
 	bodyLimit     = "1M"
 	healthTimeout = 2 * time.Second
+	gzipMinBytes  = 1024
 )
 
 // NewRouter builds the Echo instance with shared middleware and routes.
@@ -67,6 +68,13 @@ func NewRouter(deps Deps) *echo.Echo {
 		e.Use(corsMiddleware(deps.AllowedOrigins))
 	}
 	e.Use(middleware.BodyLimit(bodyLimit))
+	// Note bodies are Markdown, which compresses several-fold; this mostly pays
+	// off when viewers refetch a large note after every live update. Small
+	// responses aren't worth the CPU, and the WebSocket upgrade is left alone.
+	e.Use(middleware.GzipWithConfig(middleware.GzipConfig{
+		MinLength: gzipMinBytes,
+		Skipper:   func(c echo.Context) bool { return c.Path() == "/api/v1/ws" },
+	}))
 
 	h := &handler{
 		pinger: deps.Pinger, notes: deps.Notes, hub: deps.Hub, tokens: deps.DevTokens,
