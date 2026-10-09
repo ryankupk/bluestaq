@@ -9,6 +9,8 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+
+	"github.com/ryankupk/notes/internal/note"
 )
 
 // Pinger reports whether a backing dependency is reachable. It is declared here,
@@ -17,9 +19,11 @@ type Pinger interface {
 	Ping(ctx context.Context) error
 }
 
-// Deps are the collaborators the router needs. Later phases add the note service and event hub.
+// Deps are the collaborators the router needs. Later phases add the event hub.
 type Deps struct {
 	Pinger Pinger
+	// Notes is wired by main but not yet used; the note handlers arrive with the next phase.
+	Notes  *note.Service
 	Logger *slog.Logger
 }
 

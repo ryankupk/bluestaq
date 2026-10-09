@@ -18,10 +18,13 @@ import (
 
 	"github.com/ryankupk/notes/internal/config"
 	"github.com/ryankupk/notes/internal/httpapi"
+	"github.com/ryankupk/notes/internal/note"
+	"github.com/ryankupk/notes/internal/store/mongostore"
 )
 
 const (
 	connectTimeout  = 10 * time.Second
+	indexTimeout    = 30 * time.Second
 	shutdownTimeout = 10 * time.Second
 )
 
@@ -70,7 +73,17 @@ func run() error {
 	}
 	logger.Info("connected to mongo", "db", cfg.MongoDB)
 
-	router := httpapi.NewRouter(httpapi.Deps{Pinger: mongoPinger{client}, Logger: logger})
+	store := mongostore.New(client.Database(cfg.MongoDB).Collection(cfg.NotesCollection))
+	indexCtx, cancelIndexes := context.WithTimeout(ctx, indexTimeout)
+	defer cancelIndexes()
+	if err := store.EnsureIndexes(indexCtx); err != nil {
+		return err
+	}
+
+	// NopPublisher until the live-update hub exists.
+	notes := note.NewService(store, note.NopPublisher{}, nil, nil)
+
+	router := httpapi.NewRouter(httpapi.Deps{Pinger: mongoPinger{client}, Notes: notes, Logger: logger})
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           router,
