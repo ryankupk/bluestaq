@@ -10,6 +10,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 
+	"github.com/ryankupk/notes/internal/events"
 	"github.com/ryankupk/notes/internal/note"
 )
 
@@ -19,10 +20,12 @@ type Pinger interface {
 	Ping(ctx context.Context) error
 }
 
-// Deps are the collaborators the router needs. Later phases add the event hub.
+// Deps are the collaborators the router needs. Hub is optional: without it
+// the WebSocket route is not registered.
 type Deps struct {
 	Pinger Pinger
 	Notes  *note.Service
+	Hub    *events.Hub
 	Logger *slog.Logger
 }
 
@@ -49,7 +52,7 @@ func NewRouter(deps Deps) *echo.Echo {
 	e.Use(requestLogger(logger))
 	e.Use(middleware.BodyLimit(bodyLimit))
 
-	h := &handler{pinger: deps.Pinger, notes: deps.Notes}
+	h := &handler{pinger: deps.Pinger, notes: deps.Notes, hub: deps.Hub, logger: logger}
 	e.GET("/healthz", h.healthz)
 
 	v1 := e.Group("/api/v1")
@@ -59,6 +62,9 @@ func NewRouter(deps Deps) *echo.Echo {
 	v1.PUT("/notes/:id", h.updateNote)
 	v1.DELETE("/notes/:id", h.deleteNote)
 	v1.GET("/folders", h.listFolders)
+	if deps.Hub != nil {
+		v1.GET("/ws", h.watch)
+	}
 
 	return e
 }
@@ -92,6 +98,8 @@ func requestLogger(logger *slog.Logger) echo.MiddlewareFunc {
 type handler struct {
 	pinger Pinger
 	notes  *note.Service
+	hub    *events.Hub
+	logger *slog.Logger
 }
 
 func (h *handler) healthz(c echo.Context) error {

@@ -17,6 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
 	"github.com/ryankupk/notes/internal/config"
+	"github.com/ryankupk/notes/internal/events"
 	"github.com/ryankupk/notes/internal/httpapi"
 	"github.com/ryankupk/notes/internal/note"
 	"github.com/ryankupk/notes/internal/store/mongostore"
@@ -80,10 +81,10 @@ func run() error {
 		return err
 	}
 
-	// NopPublisher until the live-update hub exists.
-	notes := note.NewService(store, note.NopPublisher{}, nil, nil)
+	hub := events.NewHub(events.DefaultBuffer)
+	notes := note.NewService(store, hub, nil, nil)
 
-	router := httpapi.NewRouter(httpapi.Deps{Pinger: mongoPinger{client}, Notes: notes, Logger: logger})
+	router := httpapi.NewRouter(httpapi.Deps{Pinger: mongoPinger{client}, Notes: notes, Hub: hub, Logger: logger})
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           router,

@@ -20,6 +20,16 @@ const userHeader = "X-User-ID"
 // its body; the service defaults an empty actor to "anonymous".
 func actor(c echo.Context) string { return c.Request().Header.Get(userHeader) }
 
+// wsActor also accepts ?user= because browsers cannot set headers on a
+// WebSocket handshake. It is kept off REST routes so a URL can't override the
+// header there.
+func wsActor(c echo.Context) string {
+	if u := c.QueryParam("user"); u != "" {
+		return u
+	}
+	return actor(c)
+}
+
 func badRequest(format string, args ...any) error {
 	return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf(format, args...))
 }

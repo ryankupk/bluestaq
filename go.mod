@@ -10,6 +10,7 @@ require (
 )
 
 require (
+	github.com/coder/websocket v1.8.15 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/labstack/gommon v0.5.0 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
