@@ -1,0 +1,5 @@
+.env
+coverage.out
+coverage.html
+/bin
+CLAUDE.md
