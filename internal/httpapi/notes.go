@@ -14,42 +14,31 @@ import (
 	"github.com/ryankupk/notes/internal/note"
 )
 
-const userHeader = "X-User-ID"
-
-// actor is the single place the caller's identity is read. Auth will replace
-// its body; the service defaults an empty actor to "anonymous".
-func actor(c echo.Context) string { return c.Request().Header.Get(userHeader) }
-
-// wsActor also accepts ?user= because browsers cannot set headers on a
-// WebSocket handshake. It is kept off REST routes so a URL can't override the
-// header there.
-func wsActor(c echo.Context) string {
-	if u := c.QueryParam("user"); u != "" {
-		return u
-	}
-	return actor(c)
-}
-
 func badRequest(format string, args ...any) error {
 	return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf(format, args...))
 }
 
-// decodeNote strictly decodes a JSON body: unknown fields and trailing data are rejected.
-func decodeNote(c echo.Context) (noteRequest, error) {
-	var req noteRequest
+// decodeJSON strictly decodes a JSON body into dst: unknown fields and trailing data are rejected.
+func decodeJSON(c echo.Context, dst any) error {
 	dec := json.NewDecoder(c.Request().Body)
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	if err := dec.Decode(dst); err != nil {
 		var httpErr *echo.HTTPError
 		if errors.As(err, &httpErr) {
-			return req, httpErr // e.g. 413 from the body limit middleware
+			return httpErr // e.g. 413 from the body limit middleware
 		}
-		return req, badRequest("invalid JSON body: %v", err)
+		return badRequest("invalid JSON body: %v", err)
 	}
 	if dec.More() {
-		return req, badRequest("invalid JSON body: unexpected data after object")
+		return badRequest("invalid JSON body: unexpected data after object")
 	}
-	return req, nil
+	return nil
+}
+
+func decodeNote(c echo.Context) (noteRequest, error) {
+	var req noteRequest
+	err := decodeJSON(c, &req)
+	return req, err
 }
 
 // requireVersion reads the mandatory If-Match precondition.

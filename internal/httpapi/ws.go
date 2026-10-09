@@ -17,8 +17,6 @@ import (
 )
 
 const (
-	anonymousUser = "anonymous"
-
 	// Client frames are tiny ({"type":..,"noteId":..}); anything bigger is abuse.
 	wsReadLimit     = 4 << 10
 	wsWriteTimeout  = 10 * time.Second
@@ -70,13 +68,12 @@ func (h *handler) watch(c echo.Context) error {
 	if err != nil {
 		return badRequest("invalid prefix: %v", validationMessage(err))
 	}
-	user := wsActor(c)
-	if user == "" {
-		user = anonymousUser
-	}
+	user := actor(c)
 
-	// Origin checks (CORS) are deferred together with auth; accept any origin for now.
-	conn, err := websocket.Accept(c.Response(), c.Request(), &websocket.AcceptOptions{InsecureSkipVerify: true})
+	// Browsers do not apply CORS to WebSockets, so the origin check is ours.
+	// Same-origin is always accepted by the library; OriginPatterns adds the
+	// configured CORS origins.
+	conn, err := websocket.Accept(c.Response(), c.Request(), &websocket.AcceptOptions{OriginPatterns: h.wsOrigins})
 	if err != nil {
 		// Accept has already written the HTTP error response.
 		return nil

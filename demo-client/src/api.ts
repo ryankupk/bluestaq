@@ -23,11 +23,59 @@ export class ApiError extends Error {
   }
 }
 
+// Dev tokens are minted by name, cached in memory and sessionStorage (survives reloads).
+const tokens = new Map<string, string>()
+const storeKey = (user: string) => `token:${user}`
+
+export async function getToken(user: string): Promise<string> {
+  let token = tokens.get(user)
+  try {
+    token ??= sessionStorage.getItem(storeKey(user)) ?? undefined
+  } catch {
+    /* storage unavailable: token just won't survive a reload */
+  }
+  if (token) {
+    tokens.set(user, token)
+    return token
+  }
+  const res = await fetch('/api/v1/auth/dev-token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user }),
+  })
+  const json = await res.json().catch(() => null)
+  if (!res.ok) throw new ApiError(res.status, json?.error?.message ?? res.statusText)
+  tokens.set(user, json.token)
+  try {
+    sessionStorage.setItem(storeKey(user), json.token)
+  } catch {
+    /* see above */
+  }
+  return json.token
+}
+
+// Called when the server rejected a token (restart with a new secret, or expiry).
+export function invalidateToken(user: string) {
+  tokens.delete(user)
+  try {
+    sessionStorage.removeItem(storeKey(user))
+  } catch {
+    /* see above */
+  }
+}
+
 async function call<T>(user: string, method: string, url: string, body?: NoteInput, ifMatch?: number): Promise<T> {
-  const headers: Record<string, string> = { 'X-User-ID': user || 'anonymous' }
-  if (body) headers['Content-Type'] = 'application/json'
-  if (ifMatch !== undefined) headers['If-Match'] = `"${ifMatch}"`
-  const res = await fetch(`/api/v1${url}`, { method, headers, body: body && JSON.stringify(body) })
+  const send = async () => {
+    const headers: Record<string, string> = { Authorization: `Bearer ${await getToken(user)}` }
+    if (body) headers['Content-Type'] = 'application/json'
+    if (ifMatch !== undefined) headers['If-Match'] = `"${ifMatch}"`
+    return fetch(`/api/v1${url}`, { method, headers, body: body && JSON.stringify(body) })
+  }
+  let res = await send()
+  if (res.status === 401) {
+    invalidateToken(user)
+    res = await send() // once, with a fresh token
+  }
   const json = await res.json().catch(() => null)
   if (!res.ok) throw new ApiError(res.status, json?.error?.message ?? res.statusText, json?.current)
   return json as T

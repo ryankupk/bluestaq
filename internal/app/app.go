@@ -7,10 +7,12 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
+	"github.com/ryankupk/notes/internal/auth"
 	"github.com/ryankupk/notes/internal/events"
 	"github.com/ryankupk/notes/internal/httpapi"
 	"github.com/ryankupk/notes/internal/note"
@@ -30,9 +32,25 @@ func (p mongoPinger) Ping(ctx context.Context) error {
 	return p.client.Ping(ctx, readpref.Primary())
 }
 
+// Options is the authentication and browser-access configuration.
+type Options struct {
+	// JWTSecret signs and verifies tokens (at least auth.MinSecretBytes).
+	JWTSecret []byte
+	// TokenTTL is how long issued tokens live.
+	TokenTTL time.Duration
+	// DevTokens exposes POST /api/v1/auth/dev-token. Demo use only.
+	DevTokens bool
+	// CORSAllowedOrigins also gates WebSocket upgrades; empty means same-origin only.
+	CORSAllowedOrigins []string
+}
+
 // New ensures the collection's indexes and wires the service on top of
 // collection. The caller owns the Mongo client and its lifecycle.
-func New(ctx context.Context, collection *mongo.Collection, logger *slog.Logger) (*App, error) {
+func New(ctx context.Context, collection *mongo.Collection, logger *slog.Logger, opts Options) (*App, error) {
+	tokens, err := auth.NewHS256(opts.JWTSecret, opts.TokenTTL)
+	if err != nil {
+		return nil, err
+	}
 	store := mongostore.New(collection)
 	if err := store.EnsureIndexes(ctx); err != nil {
 		return nil, err
@@ -40,12 +58,18 @@ func New(ctx context.Context, collection *mongo.Collection, logger *slog.Logger)
 
 	hub := events.NewHub(events.DefaultBuffer)
 	notes := note.NewService(store, hub, nil, nil)
-	router := httpapi.NewRouter(httpapi.Deps{
-		Pinger: mongoPinger{collection.Database().Client()},
-		Notes:  notes,
-		Hub:    hub,
-		Logger: logger,
-	})
+	deps := httpapi.Deps{
+		Pinger:         mongoPinger{collection.Database().Client()},
+		Notes:          notes,
+		Hub:            hub,
+		Logger:         logger,
+		Verifier:       tokens,
+		AllowedOrigins: opts.CORSAllowedOrigins,
+	}
+	if opts.DevTokens {
+		deps.DevTokens = tokens
+	}
+	router := httpapi.NewRouter(deps)
 	return &App{handler: router, hub: hub}, nil
 }
 

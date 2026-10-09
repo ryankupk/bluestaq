@@ -66,7 +66,18 @@ func run() error {
 
 	indexCtx, cancelIndexes := context.WithTimeout(ctx, indexTimeout)
 	defer cancelIndexes()
-	service, err := app.New(indexCtx, client.Database(cfg.MongoDB).Collection(cfg.NotesCollection), logger)
+	if cfg.AuthMode == config.AuthDev {
+		logger.Warn("AUTH_MODE=dev: anyone can mint a token for any user name; do not expose this to untrusted networks")
+	}
+	if cfg.JWTSecretGenerated {
+		logger.Warn("JWT_SECRET not set; generated a random one, so tokens will not survive restarts")
+	}
+	service, err := app.New(indexCtx, client.Database(cfg.MongoDB).Collection(cfg.NotesCollection), logger, app.Options{
+		JWTSecret:          []byte(cfg.JWTSecret),
+		TokenTTL:           cfg.JWTTTL,
+		DevTokens:          cfg.AuthMode == config.AuthDev,
+		CORSAllowedOrigins: cfg.CORSAllowedOrigins,
+	})
 	if err != nil {
 		return err
 	}

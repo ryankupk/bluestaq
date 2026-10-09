@@ -1,3 +1,4 @@
+import { getToken, invalidateToken } from './api'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 export interface LiveNote {
@@ -12,7 +13,7 @@ export type LiveEvent =
   | { type: 'presence'; presence: { noteId: string; user: string; state: 'editing' | 'stopped' } }
   | { type: 'hello' }
 
-// Connects to the WebSocket as `user`, reconnecting with 1s -> 5s backoff.
+// Connects to the WebSocket as `user` (idle while blank), reconnecting with 1s -> 5s backoff.
 export function useLiveEvents(user: string, onEvent: (e: LiveEvent) => void, onOpen: () => void) {
   const [connected, setConnected] = useState(false)
   const ws = useRef<WebSocket | null>(null)
@@ -24,11 +25,26 @@ export function useLiveEvents(user: string, onEvent: (e: LiveEvent) => void, onO
     let delay = 1000
     let timer: number | undefined
 
-    const connect = () => {
+    const retry = () => {
+      timer = window.setTimeout(connect, delay)
+      delay = Math.min(delay * 2, 5000)
+    }
+
+    const connect = async () => {
+      let token: string
+      try {
+        token = await getToken(user)
+      } catch {
+        if (!stopped) retry()
+        return
+      }
+      if (stopped) return
       const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-      const sock = new WebSocket(`${proto}://${location.host}/api/v1/ws?user=${encodeURIComponent(user || 'anonymous')}`)
+      const sock = new WebSocket(`${proto}://${location.host}/api/v1/ws?access_token=${encodeURIComponent(token)}`)
       ws.current = sock
+      let opened = false
       sock.onopen = () => {
+        opened = true
         delay = 1000
         setConnected(true)
         handlers.current.onOpen()
@@ -37,10 +53,12 @@ export function useLiveEvents(user: string, onEvent: (e: LiveEvent) => void, onO
       sock.onclose = () => {
         setConnected(false)
         if (stopped) return
-        timer = window.setTimeout(connect, delay)
-        delay = Math.min(delay * 2, 5000)
+        // Never opened: probably a rejected token (server restart), so mint a new one next time.
+        if (!opened) invalidateToken(user)
+        retry()
       }
     }
+    if (!user) return
     connect()
     return () => {
       stopped = true

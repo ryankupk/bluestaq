@@ -27,13 +27,16 @@ type wsEnv struct {
 	hub *events.Hub
 }
 
-func newWSEnv(t *testing.T) *wsEnv {
+// newWSEnv starts a server; allowedOrigins configures the CORS/WebSocket origin allowlist.
+func newWSEnv(t *testing.T, allowedOrigins ...string) *wsEnv {
 	t.Helper()
 	hub := events.NewHub(0)
 	svc := note.NewService(memstore.New(), hub, nil, nil)
+	tokens := newTestTokens(t)
 	srv := httptest.NewServer(NewRouter(Deps{
 		Pinger: fakePinger{}, Notes: svc, Hub: hub,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier: tokens, AllowedOrigins: allowedOrigins,
 	}))
 	t.Cleanup(srv.Close)
 	return &wsEnv{t: t, srv: srv, hub: hub}
@@ -71,12 +74,18 @@ type wsClient struct {
 	conn *websocket.Conn
 }
 
-// dial connects and consumes the hello frame, so on return the subscription is live.
-func (e *wsEnv) dial(query string) *wsClient {
+// wsURL builds the WebSocket URL, authenticating as user through access_token like a browser would.
+func (e *wsEnv) wsURL(user, query string) string {
+	token := strings.TrimPrefix(bearerFor(e.t, user), "Bearer ")
+	return "ws" + strings.TrimPrefix(e.srv.URL, "http") + "/api/v1/ws?access_token=" + token + "&" + query
+}
+
+// dial connects as user and consumes the hello frame, so on return the subscription is live.
+func (e *wsEnv) dial(user, query string) *wsClient {
 	e.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	url := "ws" + strings.TrimPrefix(e.srv.URL, "http") + "/api/v1/ws?" + query
+	url := e.wsURL(user, query)
 	conn, _, err := websocket.Dial(ctx, url, nil)
 	if err != nil {
 		e.t.Fatalf("dial: %v", err)
@@ -128,6 +137,7 @@ func (e *wsEnv) rest(method, path, body string, hdr ...string) (int, map[string]
 	if err != nil {
 		e.t.Fatal(err)
 	}
+	req.Header.Set("Authorization", bearerFor(e.t, "tester"))
 	for i := 0; i+1 < len(hdr); i += 2 {
 		req.Header.Set(hdr[i], hdr[i+1])
 	}
@@ -143,7 +153,7 @@ func (e *wsEnv) rest(method, path, body string, hdr ...string) (int, map[string]
 
 func (e *wsEnv) create(path, user string) (id string, version int64) {
 	e.t.Helper()
-	status, out := e.rest(http.MethodPost, "/notes", fmt.Sprintf(`{"path":%q,"body":"x"}`, path), "X-User-ID", user)
+	status, out := e.rest(http.MethodPost, "/notes", fmt.Sprintf(`{"path":%q,"body":"x"}`, path), "Authorization", bearerFor(e.t, user))
 	if status != http.StatusCreated {
 		e.t.Fatalf("create status = %d", status)
 	}
@@ -154,7 +164,7 @@ func TestWSHello(t *testing.T) {
 	e := newWSEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http")+"/api/v1/ws?prefix=eng&user=alice", nil)
+	conn, _, err := websocket.Dial(ctx, e.wsURL("alice", "prefix=eng"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,38 +178,11 @@ func TestWSHello(t *testing.T) {
 	}
 }
 
-func TestWSDefaultsAndHeaderIdentity(t *testing.T) {
-	e := newWSEnv(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	url := "ws" + strings.TrimPrefix(e.srv.URL, "http") + "/api/v1/ws"
-
-	conn, _, err := websocket.Dial(ctx, url, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.CloseNow()
-	var f frame
-	if err := wsjson.Read(ctx, conn, &f); err != nil || f.User != "anonymous" {
-		t.Errorf("anonymous: %+v %v", f, err)
-	}
-
-	conn2, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPHeader: http.Header{"X-User-ID": {"bob"}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn2.CloseNow()
-	f = frame{}
-	if err := wsjson.Read(ctx, conn2, &f); err != nil || f.User != "bob" {
-		t.Errorf("header identity: %+v %v", f, err)
-	}
-}
-
 func TestWSInvalidPrefixRejected(t *testing.T) {
 	e := newWSEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http")+"/api/v1/ws?prefix=../x", nil)
+	_, resp, err := websocket.Dial(ctx, e.wsURL("alice", "prefix=../x"), nil)
 	if err == nil || resp == nil || resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("err=%v resp=%v, want 400", err, resp)
 	}
@@ -207,7 +190,7 @@ func TestWSInvalidPrefixRejected(t *testing.T) {
 
 func TestWSNoteLifecycleEvents(t *testing.T) {
 	e := newWSEnv(t)
-	c := e.dial("")
+	c := e.dial("tester", "")
 
 	id, v := e.create("eng/a.md", "alice")
 	f := c.next()
@@ -216,7 +199,7 @@ func TestWSNoteLifecycleEvents(t *testing.T) {
 		t.Fatalf("created = %+v", f)
 	}
 
-	status, _ := e.rest(http.MethodPut, "/notes/"+id, `{"path":"eng/a.md","body":"y"}`, "If-Match", fmt.Sprint(v), "X-User-ID", "bob")
+	status, _ := e.rest(http.MethodPut, "/notes/"+id, `{"path":"eng/a.md","body":"y"}`, "If-Match", fmt.Sprint(v), "Authorization", bearerFor(e.t, "bob"))
 	if status != http.StatusOK {
 		t.Fatalf("update status %d", status)
 	}
@@ -237,8 +220,8 @@ func TestWSNoteLifecycleEvents(t *testing.T) {
 
 func TestWSMoveOutOfPrefixNotifiesOldSubscribers(t *testing.T) {
 	e := newWSEnv(t)
-	eng := e.dial("prefix=eng/")
-	ops := e.dial("prefix=ops/")
+	eng := e.dial("tester", "prefix=eng/")
+	ops := e.dial("tester", "prefix=ops/")
 	id, v := e.create("eng/a.md", "alice")
 	if f := eng.next(); f.Type != "note.created" {
 		t.Fatalf("eng got %+v", f)
@@ -258,7 +241,7 @@ func TestWSMoveOutOfPrefixNotifiesOldSubscribers(t *testing.T) {
 
 func TestWSHubCloseSendsGoingAway(t *testing.T) {
 	e := newWSEnv(t)
-	c := e.dial("")
+	c := e.dial("tester", "")
 	e.hub.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -269,8 +252,7 @@ func TestWSHubCloseSendsGoingAway(t *testing.T) {
 	}
 
 	// New connections after shutdown are told to go away as well.
-	url := "ws" + strings.TrimPrefix(e.srv.URL, "http") + "/api/v1/ws"
-	late, _, err := websocket.Dial(ctx, url, nil)
+	late, _, err := websocket.Dial(ctx, e.wsURL("tester", ""), nil)
 	if err != nil {
 		t.Fatalf("dial after close: %v", err)
 	}
@@ -287,8 +269,8 @@ func TestWSHubCloseSendsGoingAway(t *testing.T) {
 
 func TestWSPrefixFilter(t *testing.T) {
 	e := newWSEnv(t)
-	eng := e.dial("prefix=eng/")
-	all := e.dial("")
+	eng := e.dial("tester", "prefix=eng/")
+	all := e.dial("tester", "")
 
 	e.create("ops/x.md", "a")
 	e.create("eng/y.md", "a")
@@ -309,9 +291,9 @@ func TestWSPrefixFilter(t *testing.T) {
 func TestWSPresenceRelayedToOthersNotSender(t *testing.T) {
 	e := newWSEnv(t)
 	id, _ := e.create("eng/doc.md", "x")
-	alice := e.dial("user=alice")
-	bob := e.dial("user=bob")
-	other := e.dial("prefix=ops/&user=carol")
+	alice := e.dial("alice", "")
+	bob := e.dial("bob", "")
+	other := e.dial("carol", "prefix=ops/")
 
 	alice.send(map[string]string{"type": "editing", "noteId": id})
 	f := bob.next()
@@ -333,8 +315,8 @@ func TestWSDisconnectEmitsStopped(t *testing.T) {
 	e := newWSEnv(t)
 	id1, _ := e.create("eng/1.md", "x")
 	id2, _ := e.create("eng/2.md", "x")
-	alice := e.dial("user=alice")
-	bob := e.dial("user=bob")
+	alice := e.dial("alice", "")
+	bob := e.dial("bob", "")
 
 	alice.send(map[string]string{"type": "editing", "noteId": id1})
 	alice.send(map[string]string{"type": "editing", "noteId": id2})
@@ -355,7 +337,7 @@ func TestWSDisconnectEmitsStopped(t *testing.T) {
 
 func TestWSInvalidMessagesKeepConnectionOpen(t *testing.T) {
 	e := newWSEnv(t)
-	c := e.dial("")
+	c := e.dial("tester", "")
 
 	cases := []struct {
 		name string
@@ -390,7 +372,7 @@ func TestWSInvalidMessagesKeepConnectionOpen(t *testing.T) {
 
 func TestWSOversizedMessageClosesConnection(t *testing.T) {
 	e := newWSEnv(t)
-	c := e.dial("")
+	c := e.dial("tester", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = c.conn.Write(ctx, websocket.MessageText, []byte(`{"type":"editing","noteId":"`+strings.Repeat("a", 8<<10)+`"}`))
@@ -407,7 +389,7 @@ func TestWSNoGoroutineLeaks(t *testing.T) {
 	before := runtime.NumGoroutine()
 
 	for range 5 {
-		c := e.dial("")
+		c := e.dial("tester", "")
 		e.create("eng/leak.md"+fmt.Sprint(time.Now().UnixNano()), "x")
 		c.next()
 		_ = c.conn.Close(websocket.StatusNormalClosure, "")

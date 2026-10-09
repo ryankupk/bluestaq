@@ -33,6 +33,8 @@ func codeForStatus(status int) string {
 	switch status {
 	case http.StatusBadRequest:
 		return "invalid_request"
+	case http.StatusUnauthorized:
+		return "unauthorized"
 	case http.StatusNotFound:
 		return "not_found"
 	case http.StatusConflict:
@@ -97,6 +99,10 @@ func newErrorHandler(logger *slog.Logger) echo.HTTPErrorHandler {
 			} else {
 				message = http.StatusText(status)
 			}
+		}
+		if status == http.StatusUnauthorized {
+			// RFC 9110 requires 401 to say how to authenticate.
+			c.Response().Header().Set(echo.HeaderWWWAuthenticate, "Bearer")
 		}
 		if status >= 500 {
 			logger.Error("request failed", "error", err, "path", c.Request().URL.Path)

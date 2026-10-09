@@ -24,11 +24,24 @@ type testEnv struct {
 
 func newEnv(t *testing.T) *testEnv {
 	t.Helper()
-	svc := note.NewService(memstore.New(), nil, nil, nil)
-	srv := NewRouter(Deps{Pinger: fakePinger{}, Notes: svc, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	return newEnvWithService(t, note.NewService(memstore.New(), nil, nil, nil))
+}
+
+func newEnvWithService(t *testing.T, svc *note.Service) *testEnv {
+	t.Helper()
+	tokens := newTestTokens(t)
+	srv := NewRouter(Deps{
+		Pinger: fakePinger{}, Notes: svc, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier: tokens, DevTokens: tokens,
+	})
 	return &testEnv{t: t, srv: srv}
 }
 
+// as returns the Authorization value for user.
+func (e *testEnv) as(user string) string { return bearerFor(e.t, user) }
+
+// do sends a request, authenticated as "tester" unless hdr sets Authorization itself
+// (an empty value sends no credentials).
 func (e *testEnv) do(method, target, body string, hdr ...string) *httptest.ResponseRecorder {
 	e.t.Helper()
 	var r io.Reader
@@ -36,6 +49,7 @@ func (e *testEnv) do(method, target, body string, hdr ...string) *httptest.Respo
 		r = strings.NewReader(body)
 	}
 	req := httptest.NewRequest(method, target, r)
+	req.Header.Set("Authorization", e.as("tester"))
 	for i := 0; i+1 < len(hdr); i += 2 {
 		req.Header.Set(hdr[i], hdr[i+1])
 	}
@@ -75,7 +89,7 @@ const notesURL = "/api/v1/notes"
 
 func TestCreate(t *testing.T) {
 	e := newEnv(t)
-	rec := e.do(http.MethodPost, notesURL, `{"path":"/eng//deploy.md","body":"hi","tags":["B","a"]}`, userHeader, "alice")
+	rec := e.do(http.MethodPost, notesURL, `{"path":"/eng//deploy.md","body":"hi","tags":["B","a"]}`, "Authorization", e.as("alice"))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
 	}
@@ -170,10 +184,10 @@ func TestGet(t *testing.T) {
 
 func TestUpdate(t *testing.T) {
 	e := newEnv(t)
-	n := e.create("eng/a.md", "v1", userHeader, "alice")
+	n := e.create("eng/a.md", "v1", "Authorization", e.as("alice"))
 	url := notesURL + "/" + n.ID
 
-	rec := e.do(http.MethodPut, url, `{"path":"ops/b.md","body":"v2","tags":[]}`, "If-Match", `"1"`, userHeader, "bob")
+	rec := e.do(http.MethodPut, url, `{"path":"ops/b.md","body":"v2","tags":[]}`, "If-Match", `"1"`, "Authorization", e.as("bob"))
 	if rec.Code != 200 || rec.Header().Get("ETag") != `"2"` {
 		t.Fatalf("got %d etag %q: %s", rec.Code, rec.Header().Get("ETag"), rec.Body)
 	}
@@ -261,7 +275,7 @@ func TestDelete(t *testing.T) {
 	e := newEnv(t)
 	n := e.create("a.md", "x")
 	url := notesURL + "/" + n.ID
-	rec := e.do(http.MethodDelete, url, "", "If-Match", `"1"`, userHeader, "carol")
+	rec := e.do(http.MethodDelete, url, "", "If-Match", `"1"`, "Authorization", e.as("carol"))
 	if rec.Code != 204 || rec.Body.Len() != 0 {
 		t.Fatalf("got %d %q", rec.Code, rec.Body)
 	}
@@ -357,7 +371,7 @@ func TestListPagination(t *testing.T) {
 	// A fixed clock forces identical updatedAt values, so ordering and cursors depend on the id tiebreak.
 	at := time.Date(2024, 5, 1, 12, 0, 0, 123456789, time.UTC)
 	svc := note.NewService(memstore.New(), nil, func() time.Time { return at }, nil)
-	e := &testEnv{t: t, srv: NewRouter(Deps{Pinger: fakePinger{}, Notes: svc, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})}
+	e := newEnvWithService(t, svc)
 	for i := range 5 {
 		e.create(fmt.Sprintf("n%d.md", i), "")
 	}
@@ -428,9 +442,10 @@ func TestFolders(t *testing.T) {
 	}
 }
 
-func TestDefaultActorIsAnonymous(t *testing.T) {
-	n := newEnv(t).create("a.md", "")
-	if n.CreatedBy != "anonymous" {
-		t.Errorf("createdBy = %q", n.CreatedBy)
+func TestActorComesFromTokenNotHeader(t *testing.T) {
+	e := newEnv(t)
+	n := e.create("a.md", "", "Authorization", e.as("alice"), "X-User-ID", "mallory")
+	if n.CreatedBy != "alice" || n.UpdatedBy != "alice" {
+		t.Errorf("createdBy/updatedBy = %q/%q, want alice (X-User-ID must be ignored)", n.CreatedBy, n.UpdatedBy)
 	}
 }

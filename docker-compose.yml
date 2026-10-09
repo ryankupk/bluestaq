@@ -23,6 +23,12 @@ services:
       MONGO_DB: ${MONGO_DB:-notes}
       MONGO_NOTES_COLLECTION: ${MONGO_NOTES_COLLECTION:-notes}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # dev lets anyone mint a token by typing a name (demo only); see .env.example.
+      AUTH_MODE: ${AUTH_MODE:-dev}
+      # Passed through only when set: an empty JWT_SECRET is "unset" to the app.
+      JWT_SECRET: ${JWT_SECRET:-}
+      JWT_TTL: ${JWT_TTL:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
     ports:
       - "8080:8080"
 

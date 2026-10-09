@@ -1,5 +1,9 @@
 .PHONY: run build test test-unit test-e2e cover up down lint smoke
 
+# dev mode lets the demo sign in by typing a name; use AUTH_MODE=jwt JWT_SECRET=... for real tokens.
+AUTH_MODE ?= dev
+export AUTH_MODE
+
 run:
 	go run ./cmd/notesd
 

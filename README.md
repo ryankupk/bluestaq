@@ -16,7 +16,7 @@ curl localhost:8080/healthz
 # Or run the service locally against the compose MongoDB
 docker compose up -d mongo
 cp .env.example .env       # optional, the defaults already match compose
-make run
+make run                   # runs in AUTH_MODE=dev (see Authentication)
 ```
 
 Watch live events in a second terminal, then drive the API with the smoke script:
@@ -30,7 +30,7 @@ The smoke script walks through create, read, update, a stale update (412), a mis
 
 ## Demo client: see it working in two browser tabs
 
-`demo-client/` holds a deliberately tiny React app (about 360 lines). It's here so you can watch the server's behavior instead of reading about it. It is a demo aid, not part of the backend deliverable: no routing, no state library, no styling framework.
+`demo-client/` holds a deliberately tiny React app (about 430 lines). It's here so you can watch the server's behavior instead of reading about it. It is a demo aid, not part of the backend deliverable: no routing, no state library, no styling framework.
 
 **Run it** (needs Node 18+ and pnpm; `npx pnpm` works if pnpm isn't installed):
 
@@ -41,7 +41,7 @@ pnpm install
 pnpm dev                              # http://localhost:5173
 ```
 
-Open http://localhost:5173 in **two tabs**. Type a different name in each, for example `alice` and `bob`, and press Enter. Each tab now acts as a separate user. The Vite dev server proxies `/api`, including the WebSocket, to `:8080`, so the browser only ever talks to one origin. That's why the backend can still leave CORS deferred.
+Open http://localhost:5173 in **two tabs**. Type a different name in each, for example `alice` and `bob`, and press Enter. Each tab now acts as a separate user: pressing Enter fetches a signed token for that name from the dev-mode token endpoint, and every request after that is authenticated. The Vite dev server proxies `/api`, including the WebSocket, to `:8080`, so the browser only ever talks to one origin and the demo needs no CORS configuration. That also holds when you open it from another machine (`pnpm dev --host`, then `http://<server-ip>:5173`).
 
 **Walkthrough.** Each step shows one piece of the server:
 
@@ -71,6 +71,14 @@ Settings come from environment variables, and an optional `.env` file fills in a
 
 **`LOG_LEVEL`**: `debug`, `info`, `warn` or `error`, default `info`.
 
+**`AUTH_MODE`**: required, `dev` or `jwt`. The server refuses to start without it. Docker compose, `make run` and `.env.example` set `dev`. See Authentication.
+
+**`JWT_SECRET`**: HS256 signing secret, at least 32 bytes. Required in `jwt` mode. In `dev` mode it's generated at random on startup if unset, so tokens don't survive a restart (the demo client re-authenticates on its own).
+
+**`JWT_TTL`**: token lifetime, default `12h`.
+
+**`CORS_ALLOWED_ORIGINS`**: comma-separated origins allowed to call the API from a browser, for example `https://notes.example.com`. Empty by default, which means same-origin only. The same list governs the WebSocket origin check.
+
 **`MONGO_HOST_PORT`**: compose only, the host port for the Mongo container. Change it if a local mongod already uses 27017.
 
 ## Testing
@@ -95,44 +103,63 @@ Mongo-backed tests skip with a message when `MONGO_URI` is unset. The Makefile d
 
 ## API
 
-Base path `/api/v1`. Identity comes from the optional `X-User-ID` header, recorded as `createdBy`/`updatedBy` and defaulting to `anonymous`. It's an unauthenticated placeholder for real auth (see below). Every error has the same JSON shape: `{"error": {"code": "...", "message": "..."}}`.
+Base path `/api/v1`. Every route except `/healthz` (and the dev token endpoint) requires `Authorization: Bearer <token>`. The token's subject is the caller's identity, recorded as `createdBy`/`updatedBy`. Every error has the same JSON shape: `{"error": {"code": "...", "message": "..."}}`.
 
 | Method & path | Purpose | Notes |
 |---|---|---|
-| `GET /healthz` | Liveness and database ping | 200 or 503 |
+| `GET /healthz` | Liveness and database ping | Public; 200 or 503 |
+| `POST /auth/dev-token` | Sign in by name: `{"user":"alice"}` gives `{token, user, expiresAt}` | **Dev mode only**; 404 in `jwt` mode |
 | `POST /notes` | Create `{path, body, tags}` | 201, `ETag`, `Location`; 409 if the path is taken |
 | `GET /notes` | List / search / sync | `prefix`, `tag`, `q`, `updatedSince`, `includeDeleted`, `limit` (≤200), `cursor`, `fields=body` |
 | `GET /notes/:id` | Read one note | `ETag`; `If-None-Match` gives 304 |
 | `PUT /notes/:id` | Replace `{path, body, tags}` | Requires `If-Match`; a changed `path` renames or moves |
 | `DELETE /notes/:id` | Soft delete | Requires `If-Match`; 204 |
 | `GET /folders?prefix=eng/` | Immediate child folders with note counts | Drives a file-tree UI |
-| `GET /ws?prefix=eng/&user=alice` | WebSocket event stream | See below |
+| `GET /ws?prefix=eng/&access_token=…` | WebSocket event stream | See below |
 
-Write status codes: 400 for invalid input, 404 when the note is missing or deleted, 409 when the path is taken, 412 for a stale `If-Match` (the body includes `current`, the latest note, and `ETag` carries its version), 413 for a body over 1 MiB, and 428 when `If-Match` is missing.
+Status codes: 401 for a missing, invalid or expired token, 400 for invalid input, 404 when the note is missing or deleted, 409 when the path is taken, 412 for a stale `If-Match` (the body includes `current`, the latest note, and `ETag` carries its version), 413 for a body over 1 MiB, and 428 when `If-Match` is missing.
 
 ```sh
+# Sign in (dev mode). In fish: set TOKEN (curl ... | string match -rg '"token":"([^"]+)"')
+TOKEN=$(curl -s -XPOST localhost:8080/api/v1/auth/dev-token -d '{"user":"alice"}' | sed -E 's/.*"token":"([^"]+)".*/\1/')
+AUTH="Authorization: Bearer $TOKEN"
+
 # Create
-curl -si localhost:8080/api/v1/notes -H 'X-User-ID: alice' \
+curl -si localhost:8080/api/v1/notes -H "$AUTH" \
   -d '{"path":"eng/runbooks/deploy.md","body":"# Deploy\n","tags":["ops"]}'
 #   HTTP/1.1 201 Created
 #   Etag: "1"
 
 # Update with the version you last read
-curl -si -X PUT localhost:8080/api/v1/notes/<id> -H 'X-User-ID: bob' -H 'If-Match: "1"' \
+curl -si -X PUT localhost:8080/api/v1/notes/<id> -H "$AUTH" -H 'If-Match: "1"' \
   -d '{"path":"eng/runbooks/deploy.md","body":"# Deploy v2\n","tags":["ops"]}'
 #   HTTP/1.1 200 OK, Etag: "2". Repeating it with If-Match "1" now gives 412.
 
 # Browse and search
-curl -s 'localhost:8080/api/v1/folders?prefix=eng/'
-curl -s 'localhost:8080/api/v1/notes?prefix=eng/&tag=ops&fields=body'
-curl -s 'localhost:8080/api/v1/notes?q=deploy'
+curl -s -H "$AUTH" 'localhost:8080/api/v1/folders?prefix=eng/'
+curl -s -H "$AUTH" 'localhost:8080/api/v1/notes?prefix=eng/&tag=ops&fields=body'
+curl -s -H "$AUTH" 'localhost:8080/api/v1/notes?q=deploy'
 ```
 
 **Lists** are sorted by `(updatedAt, id)` ascending and paginated with an opaque keyset `cursor`, returned as `nextCursor`. Ascending order makes the same endpoint double as a sync feed: `?updatedSince=<last seen>&includeDeleted=true` returns everything that changed, including deletions.
 
 **WebSocket.** After connecting you get a `hello` frame. The server then pushes `note.created`, `note.updated` and `note.deleted` events for paths under `prefix`. Events carry metadata only, no body: the client refetches the body when it needs it. A note moved out of a folder is delivered to subscribers of both its old and new folders, with `previousPath` set.
 
-Clients may send `{"type":"editing","noteId":"..."}` and `{"type":"stopped","noteId":"..."}`. These are relayed to other subscribers as `presence` events and never stored. A disconnect automatically sends `stopped` for anything that connection had open. `user` is a query parameter here because browsers can't set headers on a WebSocket handshake.
+Clients may send `{"type":"editing","noteId":"..."}` and `{"type":"stopped","noteId":"..."}`. These are relayed to other subscribers as `presence` events and never stored. A disconnect automatically sends `stopped` for anything that connection had open. The token travels as `?access_token=` because browsers can't set headers on a WebSocket handshake. Only the WebSocket route accepts a token in the URL, and request logs redact it.
+
+## Authentication and CORS
+
+**The server verifies tokens; it doesn't manage users.** Every request carries a JWT (HS256, with `sub`, `exp` and `iss` checked and the algorithm pinned). The verified subject becomes the caller's identity through one helper, `actor()` in `internal/httpapi/auth.go`, so handlers never see client-supplied identity. Verification sits behind a small `auth.Verifier` interface (`internal/auth`).
+
+**`AUTH_MODE=dev`** adds `POST /api/v1/auth/dev-token`, which issues a token for any name without a password. That keeps the demo to "type a name, press Enter", and the startup log warns that anyone can sign in.
+
+**`AUTH_MODE=jwt`** is the production shape. The token endpoint doesn't exist, because issuing tokens is the identity provider's job (Okta, Entra ID, Keycloak). The service only checks signatures. Moving to a real provider means swapping the HS256 verifier for one that fetches the provider's public keys (JWKS, RS256); the middleware and handlers don't change.
+
+**Secure by default:** with `AUTH_MODE` unset the server won't start, rather than quietly running open. Only the demo paths (compose, `make run`, `.env.example`) opt into `dev`.
+
+**CORS is closed unless configured.** With `CORS_ALLOWED_ORIGINS` empty, browsers can only call the API from the same origin. Listing origins enables CORS for them (exposing `ETag` and `Location`, allowing `Authorization` and `If-Match`). The WebSocket handshake checks `Origin` against the same list, instead of accepting every origin as it did before auth. The demo client stays same-origin through the Vite proxy, which also rewrites `Origin` on the WebSocket upgrade.
+
+**Scope:** this is authentication only. Any signed-in user can read and write every note; per-folder authorization is future work.
 
 ```json
 {"type":"note.updated","note":{"id":"…","path":"eng/runbooks/deploy.md","title":"deploy.md","version":2,"tags":["ops"],"deleted":false,"updatedAt":"…","updatedBy":"bob"}}
@@ -145,6 +172,7 @@ Clients may send `{"type":"editing","noteId":"..."}` and `{"type":"stopped","not
 cmd/notesd          service entry point (config, Mongo connection, graceful shutdown)
 cmd/notes-watch     tiny WebSocket client that prints events; a stand-in for websocat
 internal/app        production wiring shared by notesd and the e2e tests
+internal/auth       JWT issuing (dev mode) and verification behind a Verifier interface
 internal/config     .env + environment loading
 internal/note       domain: Note, path/tag rules, Repository interface, Service
 internal/store      memstore (tests), mongostore (production), storetest (shared conformance suite)
@@ -185,7 +213,7 @@ The hub lives in memory inside one process. That was a conscious tradeoff: it's 
 
 ## What I'd change or add with more time
 
-**Authentication and authorization.** Replace the `X-User-ID` header (one helper, `actor()` in `internal/httpapi/notes.go`) with OIDC/JWT verification. Add folder-level ACLs, so that "team folders" become enforced rather than just a convention, and filter WebSocket events by permission. Lock down WebSocket origin checks and CORS at the same time; both are wide open today.
+**Authorization and a real identity provider.** Swap the HS256 verifier for OIDC/JWKS verification against the company's identity provider. Add folder-level ACLs, for example from a groups claim mapped to path prefixes, so "team folders" are enforced rather than a convention, and filter WebSocket events by the same permissions. WebSocket sessions should also end when their token expires; today a socket stays open after its token's expiry.
 
 **A sequence-numbered change log** in place of timestamp catch-up. `updatedSince` has a small, real gap. Two writers can take their timestamps in one order and commit in the other, so a reconnecting client can occasionally miss a change. A monotonically increasing sequence, from a counter document or from change-stream resume tokens, closes it. It's the same idea as CouchDB's `_changes?since=seq`, which LiveSync relies on.
 
@@ -229,4 +257,5 @@ Add e2e contract tests over shared app wiring, coverage report, curl smoke scrip
 Write README: running, testing, API, design choices, tradeoffs, future work
 Add minimal React demo client for live updates and conflict handling
 Demo client: serialized autosave with a manual-save toggle for showing conflicts
+Add JWT authentication with a dev-mode token endpoint, and CORS with a matching WebSocket origin check
 ```

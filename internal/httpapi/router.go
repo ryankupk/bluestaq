@@ -10,6 +10,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 
+	"github.com/ryankupk/notes/internal/auth"
 	"github.com/ryankupk/notes/internal/events"
 	"github.com/ryankupk/notes/internal/note"
 )
@@ -27,6 +28,16 @@ type Deps struct {
 	Notes  *note.Service
 	Hub    *events.Hub
 	Logger *slog.Logger
+
+	// Verifier authenticates every /api/v1 route except the dev-token endpoint.
+	// Nil rejects all requests.
+	Verifier auth.Verifier
+	// DevTokens, when set, registers POST /api/v1/auth/dev-token. Leave nil in
+	// jwt mode so the route does not exist.
+	DevTokens TokenIssuer
+	// AllowedOrigins are the browser origins permitted for CORS and WebSocket
+	// upgrades, e.g. "http://localhost:5173". Empty means same-origin only.
+	AllowedOrigins []string
 }
 
 const (
@@ -50,23 +61,47 @@ func NewRouter(deps Deps) *echo.Echo {
 	e.Use(middleware.RequestID())
 	e.Use(middleware.Recover())
 	e.Use(requestLogger(logger))
+	// CORS must come before authentication so a preflight OPTIONS, which
+	// carries no credentials, is answered instead of rejected with 401.
+	if len(deps.AllowedOrigins) > 0 {
+		e.Use(corsMiddleware(deps.AllowedOrigins))
+	}
 	e.Use(middleware.BodyLimit(bodyLimit))
 
-	h := &handler{pinger: deps.Pinger, notes: deps.Notes, hub: deps.Hub, logger: logger}
+	h := &handler{
+		pinger: deps.Pinger, notes: deps.Notes, hub: deps.Hub, tokens: deps.DevTokens,
+		logger: logger, wsOrigins: deps.AllowedOrigins,
+	}
 	e.GET("/healthz", h.healthz)
 
+	// Authentication is applied per route rather than with Group.Use, because a
+	// group middleware also catches unknown paths and would turn the missing
+	// dev-token route in jwt mode into a 401 instead of a 404.
+	requireUser := authenticate(deps.Verifier, false)
 	v1 := e.Group("/api/v1")
-	v1.POST("/notes", h.createNote)
-	v1.GET("/notes", h.listNotes)
-	v1.GET("/notes/:id", h.getNote)
-	v1.PUT("/notes/:id", h.updateNote)
-	v1.DELETE("/notes/:id", h.deleteNote)
-	v1.GET("/folders", h.listFolders)
+	if deps.DevTokens != nil {
+		v1.POST("/auth/dev-token", h.devToken)
+	}
+	v1.POST("/notes", h.createNote, requireUser)
+	v1.GET("/notes", h.listNotes, requireUser)
+	v1.GET("/notes/:id", h.getNote, requireUser)
+	v1.PUT("/notes/:id", h.updateNote, requireUser)
+	v1.DELETE("/notes/:id", h.deleteNote, requireUser)
+	v1.GET("/folders", h.listFolders, requireUser)
 	if deps.Hub != nil {
-		v1.GET("/ws", h.watch)
+		v1.GET("/ws", h.watch, authenticate(deps.Verifier, true))
 	}
 
 	return e
+}
+
+func corsMiddleware(origins []string) echo.MiddlewareFunc {
+	return middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins:  origins,
+		AllowMethods:  []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions},
+		AllowHeaders:  []string{echo.HeaderAuthorization, echo.HeaderContentType, "If-Match", "If-None-Match"},
+		ExposeHeaders: []string{"ETag", echo.HeaderLocation},
+	})
 }
 
 func requestLogger(logger *slog.Logger) echo.MiddlewareFunc {
@@ -82,7 +117,7 @@ func requestLogger(logger *slog.Logger) echo.MiddlewareFunc {
 			attrs := []any{
 				"request_id", v.RequestID,
 				"method", v.Method,
-				"uri", v.URI,
+				"uri", redactURI(v.URI), // access_token is a credential
 				"status", v.Status,
 				"latency", v.Latency,
 			}
@@ -99,7 +134,10 @@ type handler struct {
 	pinger Pinger
 	notes  *note.Service
 	hub    *events.Hub
+	tokens TokenIssuer
 	logger *slog.Logger
+	// wsOrigins are extra Origin patterns the WebSocket upgrade accepts.
+	wsOrigins []string
 }
 
 func (h *handler) healthz(c echo.Context) error {

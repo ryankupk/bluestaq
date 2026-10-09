@@ -21,6 +21,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/golang-jwt/jwt/v5"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
@@ -46,13 +47,23 @@ type listJSON struct {
 	NextCursor string     `json:"nextCursor"`
 }
 
+// testSecret signs tokens in jwt-mode tests; it is at least 32 bytes.
+var testSecret = []byte("e2e-secret-e2e-secret-e2e-secret-!!")
+
 // env is a running app on a fresh database.
 type env struct {
-	t   *testing.T
-	srv *httptest.Server
+	t      *testing.T
+	srv    *httptest.Server
+	tokens map[string]string // dev tokens by user name
 }
 
+// newEnv starts the app in dev-auth mode, where clients get tokens the way the demo does.
 func newEnv(t *testing.T) *env {
+	t.Helper()
+	return newEnvWith(t, app.Options{JWTSecret: testSecret, TokenTTL: time.Hour, DevTokens: true})
+}
+
+func newEnvWith(t *testing.T, opts app.Options) *env {
 	t.Helper()
 	uri := os.Getenv("MONGO_URI")
 	if uri == "" {
@@ -74,7 +85,7 @@ func newEnv(t *testing.T) *env {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	service, err := app.New(ctx, db.Collection("notes"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	service, err := app.New(ctx, db.Collection("notes"), slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
 	if err != nil {
 		_ = client.Disconnect(ctx)
 		t.Fatalf("app.New: %v", err)
@@ -94,11 +105,39 @@ func newEnv(t *testing.T) *env {
 	})
 	t.Cleanup(srv.Close)
 	t.Cleanup(service.Close)
-	return &env{t: t, srv: srv}
+	return &env{t: t, srv: srv, tokens: map[string]string{}}
 }
 
-// do sends a request and returns status, headers and the raw body.
+// bearer signs user in through the dev-token endpoint, like a real client, and
+// returns an Authorization header value. Tokens are cached per user.
+func (e *env) bearer(user string) string {
+	e.t.Helper()
+	if token, ok := e.tokens[user]; ok {
+		return "Bearer " + token
+	}
+	status, _, data := e.doRaw(http.MethodPost, "/api/v1/auth/dev-token", fmt.Sprintf(`{"user":%q}`, user))
+	if status != http.StatusOK {
+		e.t.Fatalf("dev-token for %s = %d: %s", user, status, data)
+	}
+	token := decode[struct{ Token string }](e.t, data).Token
+	e.tokens[user] = token
+	return "Bearer " + token
+}
+
+// do sends a request authenticated as "tester" unless headers set Authorization
+// themselves (an empty value sends no credentials). It returns status, headers and the raw body.
 func (e *env) do(method, path, body string, headers ...string) (int, http.Header, []byte) {
+	e.t.Helper()
+	for i := 0; i+1 < len(headers); i += 2 {
+		if http.CanonicalHeaderKey(headers[i]) == "Authorization" {
+			return e.doRaw(method, path, body, headers...)
+		}
+	}
+	return e.doRaw(method, path, body, append([]string{"Authorization", e.bearer("tester")}, headers...)...)
+}
+
+// doRaw sends exactly the headers given.
+func (e *env) doRaw(method, path, body string, headers ...string) (int, http.Header, []byte) {
 	e.t.Helper()
 	var reader io.Reader
 	if body != "" {
@@ -152,7 +191,7 @@ func noteBody(path, body string, tags ...string) string {
 // create POSTs a note and returns it with its ETag.
 func (e *env) create(path, body, user string, tags ...string) (noteJSON, string) {
 	e.t.Helper()
-	hdr, data := e.expect(http.StatusCreated, http.MethodPost, "/api/v1/notes", noteBody(path, body, tags...), "X-User-ID", user)
+	hdr, data := e.expect(http.StatusCreated, http.MethodPost, "/api/v1/notes", noteBody(path, body, tags...), "Authorization", e.bearer(user))
 	n := decode[noteJSON](e.t, data)
 	if loc := hdr.Get("Location"); loc != "/api/v1/notes/"+n.ID {
 		e.t.Fatalf("Location = %q", loc)
@@ -219,7 +258,7 @@ func TestCRUDLifecycle(t *testing.T) {
 	// Updates require If-Match.
 	e.expect(http.StatusPreconditionRequired, http.MethodPut, notePath, noteBody("eng/runbooks/deploy.md", "x"))
 	hdr, data = e.expect(http.StatusOK, http.MethodPut, notePath, noteBody("eng/runbooks/deploy.md", "# Deploy v2", "ops"),
-		"If-Match", `"1"`, "X-User-ID", "bob")
+		"If-Match", `"1"`, "Authorization", e.bearer("bob"))
 	updated := decode[noteJSON](t, data)
 	if hdr.Get("ETag") != `"2"` || updated.Version != 2 || updated.UpdatedBy != "bob" || updated.CreatedBy != "alice" ||
 		*updated.Body != "# Deploy v2" || !updated.UpdatedAt.After(created.UpdatedAt) {
@@ -227,7 +266,7 @@ func TestCRUDLifecycle(t *testing.T) {
 	}
 
 	e.expect(http.StatusPreconditionRequired, http.MethodDelete, notePath, "")
-	e.expect(http.StatusNoContent, http.MethodDelete, notePath, "", "If-Match", `"2"`, "X-User-ID", "alice")
+	e.expect(http.StatusNoContent, http.MethodDelete, notePath, "", "If-Match", `"2"`, "Authorization", e.bearer("alice"))
 	e.expect(http.StatusNotFound, http.MethodGet, notePath, "")
 	e.expect(http.StatusNotFound, http.MethodPut, notePath, noteBody("eng/runbooks/deploy.md", "x"), "If-Match", `"3"`)
 
@@ -251,11 +290,11 @@ func TestTwoWriterConflict(t *testing.T) {
 	}
 
 	// A wins.
-	e.expect(http.StatusOK, http.MethodPut, notePath, noteBody("shared/plan.md", "A's edit"), "If-Match", `"1"`, "X-User-ID", "alice")
+	e.expect(http.StatusOK, http.MethodPut, notePath, noteBody("shared/plan.md", "A's edit"), "If-Match", `"1"`, "Authorization", e.bearer("alice"))
 
 	// B is rejected with the current note.
 	_, data := e.expect(http.StatusPreconditionFailed, http.MethodPut, notePath, noteBody("shared/plan.md", "B's edit"),
-		"If-Match", `"1"`, "X-User-ID", "bob")
+		"If-Match", `"1"`, "Authorization", e.bearer("bob"))
 	conflict := decode[struct {
 		Error   struct{ Code string }
 		Current noteJSON
@@ -266,7 +305,7 @@ func TestTwoWriterConflict(t *testing.T) {
 
 	// B retries on the new ETag and succeeds.
 	hdr, _ := e.expect(http.StatusOK, http.MethodPut, notePath, noteBody("shared/plan.md", "A's edit + B's edit"),
-		"If-Match", fmt.Sprintf(`"%d"`, conflict.Current.Version), "X-User-ID", "bob")
+		"If-Match", fmt.Sprintf(`"%d"`, conflict.Current.Version), "Authorization", e.bearer("bob"))
 	if hdr.Get("ETag") != `"3"` {
 		t.Fatalf("retry etag = %s", hdr.Get("ETag"))
 	}
@@ -431,12 +470,14 @@ type frame struct {
 	} `json:"presence"`
 }
 
-// dial connects and consumes the hello frame, so on return the subscription is live.
-func (e *env) dial(query string) *wsClient {
+// dial connects as user, with the token in access_token like a browser, and
+// consumes the hello frame, so on return the subscription is live.
+func (e *env) dial(user, query string) *wsClient {
 	e.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http")+"/api/v1/ws?"+query, nil)
+	token := strings.TrimPrefix(e.bearer(user), "Bearer ")
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http")+"/api/v1/ws?access_token="+token+"&"+query, nil)
 	if err != nil {
 		e.t.Fatalf("dial: %v", err)
 	}
@@ -470,8 +511,8 @@ func (c *wsClient) send(v any) {
 
 func TestWebSocketEventsAndPresence(t *testing.T) {
 	e := newEnv(t)
-	watcher := e.dial("user=watcher&prefix=eng/")
-	editor := e.dial("user=carol")
+	watcher := e.dial("watcher", "prefix=eng/")
+	editor := e.dial("carol", "")
 
 	n, _ := e.create("eng/live.md", "v1", "alice")
 	f := watcher.next()
@@ -571,4 +612,74 @@ func TestReconnectCatchUp(t *testing.T) {
 		t.Errorf("live-only catch-up = %v", got)
 	}
 	e.expect(http.StatusBadRequest, http.MethodGet, "/api/v1/notes?updatedSince=yesterday", "")
+}
+
+func TestAuthRequiredOverHTTPAndWebSocket(t *testing.T) {
+	e := newEnv(t)
+	status, hdr, data := e.doRaw(http.MethodGet, "/api/v1/notes", "")
+	if status != http.StatusUnauthorized || hdr.Get("WWW-Authenticate") != "Bearer" ||
+		decode[struct{ Error struct{ Code string } }](t, data).Error.Code != "unauthorized" {
+		t.Fatalf("no token: %d %v %s", status, hdr, data)
+	}
+	if status, _, _ := e.doRaw(http.MethodGet, "/api/v1/notes", "", "Authorization", "Bearer garbage"); status != http.StatusUnauthorized {
+		t.Fatalf("garbage token = %d, want 401", status)
+	}
+	e.expect(http.StatusOK, http.MethodGet, "/healthz", "", "Authorization", "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http")+"/api/v1/ws", nil)
+	if err == nil || resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("ws without token: err=%v resp=%v, want 401", err, resp)
+	}
+}
+
+func TestIdentityComesFromDevToken(t *testing.T) {
+	e := newEnv(t)
+	n, _ := e.create("who/a.md", "x", "alice")
+	if n.CreatedBy != "alice" || n.UpdatedBy != "alice" {
+		t.Fatalf("createdBy/updatedBy = %q/%q, want alice", n.CreatedBy, n.UpdatedBy)
+	}
+}
+
+// TestJWTMode runs the app as production would: no dev-token endpoint, and
+// tokens minted elsewhere with the shared secret.
+func TestJWTMode(t *testing.T) {
+	e := newEnvWith(t, app.Options{JWTSecret: testSecret, TokenTTL: time.Hour})
+
+	if status, _, _ := e.doRaw(http.MethodPost, "/api/v1/auth/dev-token", `{"user":"alice"}`); status != http.StatusNotFound {
+		t.Fatalf("dev-token in jwt mode = %d, want 404", status)
+	}
+
+	mint := func(secret []byte, lifetime time.Duration) string {
+		token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+			Subject: "dana", Issuer: "notes",
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(lifetime)),
+		}).SignedString(secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return token
+	}
+	good := "Bearer " + mint(testSecret, time.Hour)
+
+	_, data := e.expect(http.StatusCreated, http.MethodPost, "/api/v1/notes", noteBody("jwt/a.md", "x"), "Authorization", good)
+	if by := decode[noteJSON](t, data).CreatedBy; by != "dana" {
+		t.Errorf("createdBy = %q, want dana", by)
+	}
+	e.expect(http.StatusUnauthorized, http.MethodGet, "/api/v1/notes", "", "Authorization", "Bearer "+mint([]byte("a-different-secret-of-32-bytes!!!"), time.Hour))
+	e.expect(http.StatusUnauthorized, http.MethodGet, "/api/v1/notes", "", "Authorization", "Bearer "+mint(testSecret, -time.Minute))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http")+"/api/v1/ws?access_token="+strings.TrimPrefix(good, "Bearer "), nil)
+	if err != nil {
+		t.Fatalf("ws dial with externally minted token: %v", err)
+	}
+	defer conn.CloseNow()
+	var hello struct{ Type, User string }
+	if err := wsjson.Read(ctx, conn, &hello); err != nil || hello.Type != "hello" || hello.User != "dana" {
+		t.Fatalf("hello = %+v, %v", hello, err)
+	}
 }

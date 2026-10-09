@@ -178,12 +178,16 @@ export default function App() {
           />
         </label>
         <span className={`dot ${connected ? 'on' : 'off'}`} />
-        {connected ? 'connected' : 'reconnecting…'}
+        {!user ? 'not signed in' : connected ? `connected as ${user}` : `reconnecting as ${user}…`}
         <label>
           <input type="checkbox" checked={autosave} onChange={(e) => setAutosave(e.target.checked)} /> Autosave
         </label>
       </header>
       <aside>
+        {!user ? (
+          <p className="muted">Enter your name to start</p>
+        ) : (
+          <>
         <button onClick={create}>+ New note</button>
         <ul>
           {sorted.map((n) => {
@@ -201,9 +205,11 @@ export default function App() {
             )
           })}
         </ul>
+          </>
+        )}
       </aside>
       <main>
-        {!open ? (
+        {!user || !open ? (
           <p className="muted">Select a note.</p>
         ) : (
           <>
