@@ -1,6 +1,11 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError, Note, createNote, getNote, listNotes, saveNote } from './api'
 import { LiveEvent, useLiveEvents } from './useLiveEvents'
+
+// Autosave waits this long after the last keystroke, so a burst of typing is one PUT, not one per key.
+const SAVE_DELAY_MS = 150
+// "editing" presence clears after this much idle time, since there is no Save button to end it.
+const IDLE_MS = 3000
 
 const loadName = () => {
   try {
@@ -21,7 +26,11 @@ export default function App() {
   const [conflict, setConflict] = useState<Note | null>(null)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
+  const [saving, setSaving] = useState(false)
+  // Off = save manually, which makes a 412 conflict easy to reproduce in a demo.
+  const [autosave, setAutosave] = useState(true)
   const editing = useRef<string | null>(null) // note id we told the server we are editing
+  const idleTimer = useRef<number | undefined>(undefined)
 
   const dirty = open !== null && text !== open.body
   // Live-event handlers outlive renders, so they read current state through this ref.
@@ -77,6 +86,7 @@ export default function App() {
   )
 
   const stopEditing = () => {
+    clearTimeout(idleTimer.current)
     if (editing.current) send({ type: 'stopped', noteId: editing.current })
     editing.current = null
   }
@@ -104,34 +114,42 @@ export default function App() {
 
   const onType = (value: string) => {
     setText(value)
-    if (open && editing.current !== open.id) {
+    if (!open) return
+    if (editing.current !== open.id) {
       editing.current = open.id
       send({ type: 'editing', noteId: open.id })
     }
+    clearTimeout(idleTimer.current)
+    idleTimer.current = window.setTimeout(stopEditing, IDLE_MS)
   }
 
   // `base` is the note whose version/path/tags we write over (ours, or theirs when overwriting).
   const save = async (base: Note) => {
     setError('')
+    setSaving(true)
     try {
       const saved = await saveNote(user, base.id, { path: base.path, body: text, tags: base.tags }, base.version)
-      stopEditing()
+      if (latest.current.open?.id !== base.id) return // user switched notes mid-save
       setOpen(saved)
       setConflict(null)
       setNotice('')
-      refreshList()
     } catch (e) {
       if (e instanceof ApiError && e.status === 412 && e.current) setConflict(e.current)
       else fail(e)
+    } finally {
+      setSaving(false)
     }
   }
 
-  const discard = () => {
-    if (!open) return
-    stopEditing()
-    setText(open.body)
-    setConflict(null)
-  }
+  // Autosave: one PUT in flight at a time. Each PUT must carry the version the
+  // previous one returned, so firing per keystroke would 412 against ourselves.
+  // Text typed during a save leaves the editor dirty, which re-triggers this.
+  // A conflict pauses autosave until the user picks a resolution.
+  useEffect(() => {
+    if (!autosave || !open || !dirty || saving || conflict) return
+    const t = window.setTimeout(() => save(open), SAVE_DELAY_MS)
+    return () => clearTimeout(t)
+  }, [autosave, open, text, dirty, saving, conflict])
 
   const rename = (name: string) => {
     name = name.trim()
@@ -161,6 +179,9 @@ export default function App() {
         </label>
         <span className={`dot ${connected ? 'on' : 'off'}`} />
         {connected ? 'connected' : 'reconnecting…'}
+        <label>
+          <input type="checkbox" checked={autosave} onChange={(e) => setAutosave(e.target.checked)} /> Autosave
+        </label>
       </header>
       <aside>
         <button onClick={create}>+ New note</button>
@@ -186,7 +207,9 @@ export default function App() {
           <p className="muted">Select a note.</p>
         ) : (
           <>
-            <h2>{open.path} <small>(loaded v{open.version})</small></h2>
+            <h2>
+              {open.path} <small>v{open.version} · {saving ? 'saving…' : dirty ? (autosave ? 'saving…' : 'unsaved') : 'saved'}</small>
+            </h2>
             {conflict && (
               <div className="banner conflict">
                 {conflict.updatedBy} saved version {conflict.version} since you opened this
@@ -197,10 +220,11 @@ export default function App() {
             {notice && <div className="banner notice">{notice}</div>}
             {error && <div className="banner error">{error}</div>}
             <textarea value={text} onChange={(e) => onType(e.target.value)} />
-            <div>
-              <button onClick={() => save(open)} disabled={!dirty}>Save</button>
-              <button onClick={discard} disabled={!dirty}>Discard</button>
-            </div>
+            {!autosave && (
+              <button onClick={() => save(open)} disabled={!dirty || saving}>
+                Save
+              </button>
+            )}
           </>
         )}
         {!open && error && <div className="banner error">{error}</div>}

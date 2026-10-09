@@ -30,7 +30,7 @@ The smoke script walks through create, read, update, a stale update (412), a mis
 
 ## Demo client: see it working in two browser tabs
 
-`demo-client/` holds a deliberately tiny React app (about 340 lines). It's here so you can watch the server's behavior instead of reading about it. It is a demo aid, not part of the backend deliverable: no routing, no state library, no styling framework.
+`demo-client/` holds a deliberately tiny React app (about 360 lines). It's here so you can watch the server's behavior instead of reading about it. It is a demo aid, not part of the backend deliverable: no routing, no state library, no styling framework.
 
 **Run it** (needs Node 18+ and pnpm; `npx pnpm` works if pnpm isn't installed):
 
@@ -47,11 +47,11 @@ Open http://localhost:5173 in **two tabs**. Type a different name in each, for e
 
 1. **Live updates.** In alice's tab, click "+ New note" and give it a path such as `eng/runbooks/deploy.md`. It appears in bob's list without a refresh. The service publishes a `note.created` event to the in-process hub after the write succeeds (`internal/note/service.go`, `internal/events/hub.go`), and the WebSocket handler pushes it to every subscriber (`internal/httpapi/ws.go`).
 
-2. **Presence.** Open the note in both tabs and start typing in alice's. Bob's list shows "✎ alice" on that note. This is the ephemeral `editing` message: relayed to everyone except the sender, never stored, and cleared automatically when alice saves, switches notes or closes the tab.
+2. **Live editing and presence.** Open the note in both tabs and type in alice's. Bob's list shows "✎ alice", and bob's editor follows along as she types. The editing badge is an ephemeral `editing` message: relayed to everyone except the sender, never stored, and cleared after a few idle seconds, a note switch, or a closed tab. The live text comes from autosave. The client sends an ordinary versioned `PUT` shortly after each pause in typing, one at a time, and every other tab reloads the note when the resulting `note.updated` event arrives. This is not true collaborative editing: there is no keystroke merging (see "What I'd change").
 
-3. **Concurrent edits are detected, not lost.** Type something different in bob's tab and Save. Alice's text is left alone, and she sees "updated by bob, your save will conflict". Now Save in alice's tab. The server rejects it with **412** because her `If-Match` version is stale. That check and the write happen in one atomic MongoDB `findOneAndUpdate` (`internal/store/mongostore/mongostore.go`, `compareAndSet`). The 412 response carries bob's current note, so the banner can say who saved which version without an extra request.
+3. **Concurrent edits are detected, not lost.** Untick **Autosave** in bob's tab, which brings back a Save button, and type something. Then type in alice's tab, which still autosaves. Bob's text is left alone, and he sees "updated by alice, your save will conflict". When bob clicks Save, the server rejects it with **412** because his `If-Match` version is stale. That check and the write happen in one atomic MongoDB `findOneAndUpdate` (`internal/store/mongostore/mongostore.go`, `compareAndSet`). The 412 response carries alice's current note, so the banner can say who saved which version without an extra request.
 
-4. **Resolving it.** Alice chooses "Load their version" (take bob's text) or "Overwrite with mine" (re-save her text against bob's version). Both are ordinary REST calls. The server never guesses which edit should win; see design choice 1 below.
+4. **Resolving it.** Bob chooses "Load their version" (take alice's text) or "Overwrite with mine" (re-save his text against alice's version). Both are ordinary REST calls. The server never guesses which edit should win; see design choice 1 below.
 
 5. **Reconnect.** Stop the backend (`docker compose stop app`) and the status dot turns to "reconnecting…". Start it again (`docker compose start app`): the client reconnects with backoff and refetches the list.
 
@@ -193,6 +193,8 @@ The hub lives in memory inside one process. That was a conscious tradeoff: it's 
 
 **Revision history and server-side merging.** Store prior versions, which enables "restore" and a three-way merge using a diff library such as `sergi/go-diff`. Then the client's 412 path can become "auto-merged unless the edits overlap".
 
+**Real-time co-editing, if it becomes a requirement.** The demo client's autosave only makes edits look live; two people typing at the same moment still collide and get a 412. True Google Docs-style editing needs keystroke-level merging, so I'd adopt a CRDT (Yjs). The server would relay and persist CRDT updates per note over the existing WebSocket and hub, and periodically write a snapshot back as the note body, with versioned REST kept for clients that don't co-edit. That replaces conflict detection with merging, so it's a product decision more than a refactor. For notes that are mostly written once and read many times, I think detection plus presence is the right size.
+
 **Tombstone purge.** Soft-deleted notes are kept forever. A periodic job should purge them once every client has had time to sync, plus a trash/restore endpoint.
 
 **Operational basics:** rate limiting, request metrics and tracing, a readiness probe separate from liveness, and an OpenAPI spec generated or checked in CI.
@@ -226,4 +228,5 @@ Route moved notes to old and new prefixes; close WebSockets with 1001 on shutdow
 Add e2e contract tests over shared app wiring, coverage report, curl smoke script
 Write README: running, testing, API, design choices, tradeoffs, future work
 Add minimal React demo client for live updates and conflict handling
+Demo client: serialized autosave with a manual-save toggle for showing conflicts
 ```
