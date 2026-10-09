@@ -3,6 +3,7 @@ module github.com/ryankupk/notes
 go 1.27.2
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/joho/godotenv v1.5.1
 	github.com/labstack/echo/v4 v4.16.0
 	go.mongodb.org/mongo-driver/v2 v2.9.2
