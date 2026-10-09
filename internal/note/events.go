@@ -13,6 +13,10 @@ const (
 type Change struct {
 	Type ChangeType
 	Note Note
+	// PreviousPath is the note's path before this write. It is set only when
+	// an update changed the path, so subscribers watching the old location
+	// learn that the note left it.
+	PreviousPath string
 }
 
 // Publisher receives changes after they are durably stored. Implementations

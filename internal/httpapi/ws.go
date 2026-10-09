@@ -129,9 +129,13 @@ func (w *wsConn) writeLoop(ctx context.Context, cancel context.CancelFunc) {
 			return
 		case ev, ok := <-w.sub.C():
 			if !ok {
-				if w.sub.Dropped() {
+				switch {
+				case w.sub.Dropped():
 					// Slow consumer: tell it to reconnect and catch up via updatedSince.
 					_ = w.conn.Close(websocket.StatusTryAgainLater, "too slow; reconnect and resync")
+				case w.hub.Closed():
+					// Server shutdown: http.Server.Shutdown does not track hijacked connections.
+					_ = w.conn.Close(websocket.StatusGoingAway, "server shutting down")
 				}
 				return
 			}

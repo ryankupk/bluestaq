@@ -19,6 +19,7 @@ type Hub struct {
 	mu     sync.Mutex
 	subs   map[*Subscription]struct{}
 	buffer int
+	closed bool
 }
 
 var _ note.Publisher = (*Hub)(nil)
@@ -42,11 +43,10 @@ func (h *Hub) Publish(c note.Change) { h.Broadcast(nil, NewNoteEvent(c)) }
 // non-blocking, and it makes channel close and send mutually exclusive, which
 // is what keeps this race-free.
 func (h *Hub) Broadcast(from *Subscription, ev Event) {
-	p := ev.path()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for s := range h.subs {
-		if s == from || !matchesPrefix(s.prefix, p) {
+		if s == from || !ev.matches(s.prefix) {
 			continue
 		}
 		select {
@@ -59,13 +59,37 @@ func (h *Hub) Broadcast(from *Subscription, ev Event) {
 }
 
 // Subscribe registers a subscriber that receives events whose path starts
-// with prefix ("" matches everything).
+// with prefix ("" matches everything). On a closed hub it returns a
+// subscription whose channel is already closed.
 func (h *Hub) Subscribe(prefix string) *Subscription {
 	s := &Subscription{hub: h, prefix: prefix, ch: make(chan Event, h.buffer)}
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		close(s.ch)
+		return s
+	}
 	h.subs[s] = struct{}{}
-	h.mu.Unlock()
 	return s
+}
+
+// Close shuts the hub down: every subscription is closed and later Subscribe
+// calls get an already-closed one. It is idempotent. Consumers tell this apart
+// from a slow-consumer drop with Closed and Subscription.Dropped.
+func (h *Hub) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.closed = true
+	for s := range h.subs {
+		h.removeLocked(s)
+	}
+}
+
+// Closed reports whether Close has been called.
+func (h *Hub) Closed() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.closed
 }
 
 // Len reports the number of live subscribers.

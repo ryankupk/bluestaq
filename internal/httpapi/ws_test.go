@@ -52,6 +52,7 @@ type frame struct {
 		Tags    []string `json:"tags"`
 		Deleted bool     `json:"deleted"`
 		By      string   `json:"updatedBy"`
+		Prev    string   `json:"previousPath"`
 	} `json:"note"`
 	Presence *struct {
 		NoteID string `json:"noteId"`
@@ -231,6 +232,56 @@ func TestWSNoteLifecycleEvents(t *testing.T) {
 	f = c.next()
 	if f.Type != "note.deleted" || !f.Note.Deleted || f.Note.Version != 3 {
 		t.Fatalf("deleted = %+v", f)
+	}
+}
+
+func TestWSMoveOutOfPrefixNotifiesOldSubscribers(t *testing.T) {
+	e := newWSEnv(t)
+	eng := e.dial("prefix=eng/")
+	ops := e.dial("prefix=ops/")
+	id, v := e.create("eng/a.md", "alice")
+	if f := eng.next(); f.Type != "note.created" {
+		t.Fatalf("eng got %+v", f)
+	}
+
+	status, _ := e.rest(http.MethodPut, "/notes/"+id, `{"path":"ops/a.md","body":"x"}`, "If-Match", fmt.Sprint(v))
+	if status != http.StatusOK {
+		t.Fatalf("move status %d", status)
+	}
+	for name, c := range map[string]*wsClient{"eng": eng, "ops": ops} {
+		f := c.next()
+		if f.Type != "note.updated" || f.Note.Path != "ops/a.md" || f.Note.Prev != "eng/a.md" {
+			t.Errorf("%s got %+v", name, f.Note)
+		}
+	}
+}
+
+func TestWSHubCloseSendsGoingAway(t *testing.T) {
+	e := newWSEnv(t)
+	c := e.dial("")
+	e.hub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _, err := c.conn.Read(ctx)
+	if websocket.CloseStatus(err) != websocket.StatusGoingAway {
+		t.Fatalf("err = %v, want close 1001", err)
+	}
+
+	// New connections after shutdown are told to go away as well.
+	url := "ws" + strings.TrimPrefix(e.srv.URL, "http") + "/api/v1/ws"
+	late, _, err := websocket.Dial(ctx, url, nil)
+	if err != nil {
+		t.Fatalf("dial after close: %v", err)
+	}
+	defer late.CloseNow()
+	for {
+		if _, _, err := late.Read(ctx); err != nil {
+			if websocket.CloseStatus(err) != websocket.StatusGoingAway {
+				t.Fatalf("late err = %v, want close 1001", err)
+			}
+			break
+		}
 	}
 }
 

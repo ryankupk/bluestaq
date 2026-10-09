@@ -65,6 +65,46 @@ func TestPrefixFilter(t *testing.T) {
 	expectNone(t, eng)
 }
 
+func TestMovedNoteMatchesOldAndNewPrefix(t *testing.T) {
+	h := NewHub(0)
+	eng, ops, other := h.Subscribe("eng/"), h.Subscribe("ops/"), h.Subscribe("hr/")
+	c := change(note.ChangeUpdated, "ops/a.md", 2)
+	c.PreviousPath = "eng/a.md"
+	h.Publish(c)
+	for _, s := range []*Subscription{eng, ops} {
+		ev := recv(t, s)
+		if ev.Note.Path != "ops/a.md" || ev.Note.PreviousPath != "eng/a.md" {
+			t.Errorf("event = %+v", ev.Note)
+		}
+	}
+	expectNone(t, other)
+}
+
+func TestHubClose(t *testing.T) {
+	h := NewHub(0)
+	a, b := h.Subscribe(""), h.Subscribe("eng/")
+	h.Close()
+	h.Close() // idempotent
+	if !h.Closed() || h.Len() != 0 {
+		t.Fatalf("Closed=%v Len=%d", h.Closed(), h.Len())
+	}
+	for _, s := range []*Subscription{a, b} {
+		if _, ok := <-s.C(); ok {
+			t.Error("channel not closed")
+		}
+		if s.Dropped() {
+			t.Error("closed by hub must not look like a slow-consumer drop")
+		}
+		s.Close() // safe after hub close
+	}
+
+	late := h.Subscribe("")
+	if _, ok := <-late.C(); ok {
+		t.Error("subscription on closed hub should be closed")
+	}
+	h.Publish(change(note.ChangeCreated, "x", 1)) // must not panic
+}
+
 func TestBroadcastExcludesSender(t *testing.T) {
 	h := NewHub(0)
 	a, b := h.Subscribe(""), h.Subscribe("")

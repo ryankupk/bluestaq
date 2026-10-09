@@ -184,6 +184,37 @@ func TestUpdateAndRename(t *testing.T) {
 	}
 }
 
+func TestUpdatePublishesPreviousPathOnlyOnMove(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture()
+	n := f.create(t, "eng/a.md")
+
+	// Same path: not a move.
+	n, err := f.svc.Update(ctx, "bob", n.ID, 1, note.NoteInput{Path: "eng/a.md", Body: "v2"})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got := f.pub.changes[1].PreviousPath; got != "" {
+		t.Errorf("PreviousPath on in-place update = %q, want empty", got)
+	}
+
+	if _, err := f.svc.Update(ctx, "bob", n.ID, 2, note.NoteInput{Path: "ops/a.md", Body: "v3"}); err != nil {
+		t.Fatalf("Update (move): %v", err)
+	}
+	if got := f.pub.changes[2].PreviousPath; got != "eng/a.md" {
+		t.Errorf("PreviousPath on move = %q, want eng/a.md", got)
+	}
+
+	// A failed update publishes nothing.
+	before := len(f.pub.changes)
+	if _, err := f.svc.Update(ctx, "bob", n.ID, 1, note.NoteInput{Path: "x.md"}); !errors.Is(err, note.ErrVersionConflict) {
+		t.Fatalf("stale update err = %v", err)
+	}
+	if len(f.pub.changes) != before {
+		t.Error("failed update published a change")
+	}
+}
+
 func TestUpdateErrors(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture()

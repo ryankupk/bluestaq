@@ -36,6 +36,9 @@ type NoteSummary struct {
 	Deleted   bool      `json:"deleted"`
 	UpdatedAt time.Time `json:"updatedAt"`
 	UpdatedBy string    `json:"updatedBy"`
+	// PreviousPath is set only on a move, so subscribers of the old location
+	// can drop the note from their view.
+	PreviousPath string `json:"previousPath,omitempty"`
 }
 
 // Presence says that a user started or stopped editing a note. It is never stored.
@@ -54,15 +57,17 @@ type Event struct {
 	Presence *Presence    `json:"presence,omitempty"`
 }
 
-// path is what a subscriber's prefix filter is matched against.
-func (e Event) path() string {
+// matches reports whether a subscriber filtering on prefix should receive e.
+// A moved note matches on either its new or its previous path.
+func (e Event) matches(prefix string) bool {
 	switch {
 	case e.Note != nil:
-		return e.Note.Path
+		return strings.HasPrefix(e.Note.Path, prefix) ||
+			(e.Note.PreviousPath != "" && strings.HasPrefix(e.Note.PreviousPath, prefix))
 	case e.Presence != nil:
-		return e.Presence.Path
+		return strings.HasPrefix(e.Presence.Path, prefix)
 	}
-	return ""
+	return strings.HasPrefix("", prefix)
 }
 
 // NewNoteEvent converts a domain change into its wire event.
@@ -76,8 +81,7 @@ func NewNoteEvent(c note.Change) Event {
 		Note: &NoteSummary{
 			ID: c.Note.ID, Path: c.Note.Path, Title: path.Base(c.Note.Path), Version: c.Note.Version,
 			Tags: tags, Deleted: c.Note.Deleted, UpdatedAt: c.Note.UpdatedAt, UpdatedBy: c.Note.UpdatedBy,
+			PreviousPath: c.PreviousPath,
 		},
 	}
 }
-
-func matchesPrefix(prefix, p string) bool { return strings.HasPrefix(p, prefix) }

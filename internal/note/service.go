@@ -126,6 +126,16 @@ func (s *Service) Update(ctx context.Context, actor, id string, expectedVersion 
 	if err != nil {
 		return Note{}, err
 	}
+	// Read the current path only to route the change event to subscribers of
+	// the old location. This is not a correctness input: the compare-and-set
+	// below still decides the outcome. If another writer moves the note between
+	// this read and the write, the event may carry a stale PreviousPath; that
+	// is benign because the winning move published its own event. A missing
+	// or deleted note is left for Update to report.
+	previous, err := s.repo.Get(ctx, id)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return Note{}, fmt.Errorf("updating note: loading current note: %w", err)
+	}
 	candidate := Note{
 		ID: id, Path: in.Path, Body: in.Body, Tags: in.Tags,
 		UpdatedAt: s.now(), UpdatedBy: actorOrDefault(actor),
@@ -134,7 +144,11 @@ func (s *Service) Update(ctx context.Context, actor, id string, expectedVersion 
 	if err != nil {
 		return Note{}, s.wrapWrite(ctx, "updating note", id, err)
 	}
-	s.pub.Publish(Change{Type: ChangeUpdated, Note: updated})
+	change := Change{Type: ChangeUpdated, Note: updated}
+	if previous.Path != "" && previous.Path != updated.Path {
+		change.PreviousPath = previous.Path
+	}
+	s.pub.Publish(change)
 	return updated, nil
 }
 
