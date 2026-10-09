@@ -101,6 +101,36 @@ The tests come in three layers:
 
 Mongo-backed tests skip with a message when `MONGO_URI` is unset. The Makefile defaults it to the compose instance. `make cover` measures `./internal/...` across all test layers together: it's about 90% at the time of writing.
 
+## Performance
+
+`cmd/loadtest` simulates teams of editors. Users are split into teams of 10, and each team has 3 shared notes plus one private note per user. Every user holds a WebSocket on their team folder and edits 4 KB notes in a loop, 30% of the time on a shared note, retrying on 412. It reports throughput, conflict rate, save latency, live-event lag and WebSocket drops, and cleans up its notes afterward.
+
+```sh
+go run ./cmd/loadtest -users 500 -think 1s -duration 30s   # against the running service, which must be in dev mode
+```
+
+Results against the docker compose stack, with the service, MongoDB and the load generator all on **one 4-core / 8-thread laptop CPU** (i7-7700HQ). This is a lower bound for that box, not a capacity claim:
+
+| Users | Pause between saves | Saves/s | Conflicts | Save latency p50 / p99 | Live-event lag p99 |
+|---|---|---|---|---|---|
+| 50 | none | 643 | 36% | 46 / 122 ms | 92 ms |
+| 200 | none | 714 | 35% | 168 / 393 ms | 232 ms |
+| 500 | none | 735 | 34% | 380 / 837 ms | 426 ms |
+| 500 | 1 s (autosave-like) | 459 | 22% | 31 / 153 ms | 121 ms |
+| 1000 | 1 s | 667 | 25% | 312 / 643 ms | 342 ms |
+
+**What it shows:**
+
+- **Throughput saturates at about 700 saves/s**, and beyond that extra users only add queueing. 500 users each saving about once a second is comfortable (p99 under 160 ms); 1000 is past saturation on this machine.
+
+- **No errors, no dropped WebSockets, and 100% event delivery** in every run. Each save fans out to the 10 subscribers on its team, so the busiest run pushed about 7,400 WebSocket frames per second without a slow-consumer disconnect.
+
+- **MongoDB is the bottleneck**, at about 320–395% CPU versus 180–290% for the service. Request logging isn't a factor: the same run at `LOG_LEVEL=warn` was within noise.
+
+- **The full-text search index costs half the write throughput.** Every save re-indexes every word of the body. In an isolated A/B run (200 users, no pause, a separate instance and database), dropping the text index took the service from about 1,530 to about 3,010 PUT requests/s and halved median latency (123 to 62 ms). For write-heavy use I'd move search off the write path; see future work.
+
+- **Conflicts are high by design.** The simulated users never read live events, so on shared notes they are always stale editors. A real client that tracks versions from live events would conflict far less. Each conflict costs one extra round trip.
+
 ## API
 
 Base path `/api/v1`. Every route except `/healthz` (and the dev token endpoint) requires `Authorization: Bearer <token>`. The token's subject is the caller's identity, recorded as `createdBy`/`updatedBy`. Every error has the same JSON shape: `{"error": {"code": "...", "message": "..."}}`.
@@ -173,6 +203,7 @@ Clients may send `{"type":"editing","noteId":"..."}` and `{"type":"stopped","not
 ```
 cmd/notesd          service entry point (config, Mongo connection, graceful shutdown)
 cmd/notes-watch     tiny WebSocket client that prints events; a stand-in for websocat
+cmd/loadtest        load generator: simulated teams editing shared and private notes
 internal/app        production wiring shared by notesd and the e2e tests
 internal/auth       JWT issuing (dev mode) and verification behind a Verifier interface
 internal/config     .env + environment loading
@@ -219,7 +250,9 @@ The hub lives in memory inside one process. That was a conscious tradeoff: it's 
 
 **A sequence-numbered change log** in place of timestamp catch-up. `updatedSince` has a small, real gap. Two writers can take their timestamps in one order and commit in the other, so a reconnecting client can occasionally miss a change. A monotonically increasing sequence, from a counter document or from change-stream resume tokens, closes it. It's the same idea as CouchDB's `_changes?since=seq`, which LiveSync relies on.
 
-**Horizontal scale:** change streams or Redis for the hub, as described above.
+**Horizontal scale:** change streams or Redis for the hub, as described above. Or, migrating most-everything to cloud-native services.
+
+**Take search off the write path.** The load test showed the MongoDB text index halving write throughput. Options: index asynchronously from a change stream into a dedicated search engine (Atlas Search, OpenSearch, Meilisearch), or debounce re-indexing for notes under active edit. For notes that are mostly written once and read many times, the current inline index is a fine default.
 
 **Revision history and server-side merging.** Store prior versions, which enables "restore" and a three-way merge using a diff library such as `sergi/go-diff`. Then the client's 412 path can become "auto-merged unless the edits overlap".
 
@@ -250,23 +283,3 @@ The hub lives in memory inside one process. That was a conscious tradeoff: it's 
 **SQL (Postgres).** It would work well, and it makes the sequence-numbered change log trivial with a `BIGSERIAL`. I chose MongoDB because notes are naturally single documents with no relations, and an atomic conditional `findOneAndUpdate` is all that versioning needs.
 
 **Server-Sent Events instead of WebSockets.** SSE is simpler for one-way push and reconnects on its own. I chose WebSockets because presence is genuinely client-to-server, and it leaves room for richer collaboration later.
-
-## Commit history
-
-The history is meant to be read phase by phase: one commit per layer, then the README, then the demo client. Run `git log --oneline --reverse` for the hashes.
-
-```
-Initial commit
-Scaffold service: config, healthz, error envelope, compose, Makefile
-Add note domain: path rules, versioned service, in-memory store, shared store conformance suite
-Add MongoDB store with atomic compare-and-set writes and indexes; wire into notesd
-Add notes REST API: CRUD with ETag/If-Match concurrency, keyset pagination, folders
-Add live updates: in-process event hub, WebSocket push with prefix filters and presence, notes-watch client
-Route moved notes to old and new prefixes; close WebSockets with 1001 on shutdown; go mod tidy
-Add e2e contract tests over shared app wiring, coverage report, curl smoke script
-Write README: running, testing, API, design choices, tradeoffs, future work
-Add minimal React demo client for live updates and conflict handling
-Demo client: serialized autosave with a manual-save toggle for showing conflicts
-Add JWT authentication with a dev-mode token endpoint, and CORS with a matching WebSocket origin check
-Gzip responses over 1 KB; document incremental saves as future work
-```
