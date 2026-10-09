@@ -28,6 +28,35 @@ bash scripts/smoke.sh      # or: make smoke
 
 The smoke script walks through create, read, update, a stale update (412), a missing precondition (428), list, folders, delete and a final 404. It fails loudly on any unexpected status. The watcher prints one JSON line per event as the script runs.
 
+## Demo client: see it working in two browser tabs
+
+`demo-client/` holds a deliberately tiny React app (about 340 lines). It's here so you can watch the server's behavior instead of reading about it. It is a demo aid, not part of the backend deliverable: no routing, no state library, no styling framework.
+
+**Run it** (needs Node 18+ and pnpm; `npx pnpm` works if pnpm isn't installed):
+
+```sh
+docker compose up --build -d          # backend + MongoDB on :8080
+cd demo-client
+pnpm install
+pnpm dev                              # http://localhost:5173
+```
+
+Open http://localhost:5173 in **two tabs**. Type a different name in each, for example `alice` and `bob`, and press Enter. Each tab now acts as a separate user. The Vite dev server proxies `/api`, including the WebSocket, to `:8080`, so the browser only ever talks to one origin. That's why the backend can still leave CORS deferred.
+
+**Walkthrough.** Each step shows one piece of the server:
+
+1. **Live updates.** In alice's tab, click "+ New note" and give it a path such as `eng/runbooks/deploy.md`. It appears in bob's list without a refresh. The service publishes a `note.created` event to the in-process hub after the write succeeds (`internal/note/service.go`, `internal/events/hub.go`), and the WebSocket handler pushes it to every subscriber (`internal/httpapi/ws.go`).
+
+2. **Presence.** Open the note in both tabs and start typing in alice's. Bob's list shows "✎ alice" on that note. This is the ephemeral `editing` message: relayed to everyone except the sender, never stored, and cleared automatically when alice saves, switches notes or closes the tab.
+
+3. **Concurrent edits are detected, not lost.** Type something different in bob's tab and Save. Alice's text is left alone, and she sees "updated by bob, your save will conflict". Now Save in alice's tab. The server rejects it with **412** because her `If-Match` version is stale. That check and the write happen in one atomic MongoDB `findOneAndUpdate` (`internal/store/mongostore/mongostore.go`, `compareAndSet`). The 412 response carries bob's current note, so the banner can say who saved which version without an extra request.
+
+4. **Resolving it.** Alice chooses "Load their version" (take bob's text) or "Overwrite with mine" (re-save her text against bob's version). Both are ordinary REST calls. The server never guesses which edit should win; see design choice 1 below.
+
+5. **Reconnect.** Stop the backend (`docker compose stop app`) and the status dot turns to "reconnecting…". Start it again (`docker compose start app`): the client reconnects with backoff and refetches the list.
+
+Notes are organized by path, so a few notes under `eng/` and `ops/` make the folder model easy to see. To add them from the shell, run `bash scripts/smoke.sh` or `curl` the API directly.
+
 ## Configuration
 
 Settings come from environment variables, and an optional `.env` file fills in anything not already set. See `.env.example`.
@@ -123,6 +152,7 @@ internal/events     in-process pub/sub hub for note changes and presence
 internal/httpapi    Echo router, handlers, error mapping, ETags, WebSocket handler
 test/e2e            black-box contract tests against real MongoDB
 scripts/smoke.sh    curl walkthrough of the API
+demo-client/        minimal React app for demoing live updates and conflicts (not part of the backend)
 ```
 
 Dependencies point inward. `note` knows nothing about Mongo, HTTP or WebSockets; stores implement `note.Repository`, and the hub implements `note.Publisher`.
@@ -183,19 +213,17 @@ The hub lives in memory inside one process. That was a conscious tradeoff: it's 
 
 ## Commit history
 
-The history is meant to be read phase by phase, one commit per layer, followed by the README:
+The history is meant to be read phase by phase: one commit per layer, then the README, then the demo client. Run `git log --oneline --reverse` for the hashes.
 
 ```
-git log --oneline --reverse
-```
-
-```
-5adcf51 Initial commit
-db729b8 Scaffold service: config, healthz, error envelope, compose, Makefile
-f40c46d Add note domain: path rules, versioned service, in-memory store, shared store conformance suite
-a6d1f11 Add MongoDB store with atomic compare-and-set writes and indexes; wire into notesd
-b6d64ae Add notes REST API: CRUD with ETag/If-Match concurrency, keyset pagination, folders
-2ee38b1 Add live updates: in-process event hub, WebSocket push with prefix filters and presence, notes-watch client
-d8bd594 Route moved notes to old and new prefixes; close WebSockets with 1001 on shutdown; go mod tidy
-9b6f358 Add e2e contract tests over shared app wiring, coverage report, curl smoke script
+Initial commit
+Scaffold service: config, healthz, error envelope, compose, Makefile
+Add note domain: path rules, versioned service, in-memory store, shared store conformance suite
+Add MongoDB store with atomic compare-and-set writes and indexes; wire into notesd
+Add notes REST API: CRUD with ETag/If-Match concurrency, keyset pagination, folders
+Add live updates: in-process event hub, WebSocket push with prefix filters and presence, notes-watch client
+Route moved notes to old and new prefixes; close WebSockets with 1001 on shutdown; go mod tidy
+Add e2e contract tests over shared app wiring, coverage report, curl smoke script
+Write README: running, testing, API, design choices, tradeoffs, future work
+Add minimal React demo client for live updates and conflict handling
 ```
