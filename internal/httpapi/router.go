@@ -22,7 +22,6 @@ type Pinger interface {
 // Deps are the collaborators the router needs. Later phases add the event hub.
 type Deps struct {
 	Pinger Pinger
-	// Notes is wired by main but not yet used; the note handlers arrive with the next phase.
 	Notes  *note.Service
 	Logger *slog.Logger
 }
@@ -50,8 +49,16 @@ func NewRouter(deps Deps) *echo.Echo {
 	e.Use(requestLogger(logger))
 	e.Use(middleware.BodyLimit(bodyLimit))
 
-	h := &handler{pinger: deps.Pinger}
+	h := &handler{pinger: deps.Pinger, notes: deps.Notes}
 	e.GET("/healthz", h.healthz)
+
+	v1 := e.Group("/api/v1")
+	v1.POST("/notes", h.createNote)
+	v1.GET("/notes", h.listNotes)
+	v1.GET("/notes/:id", h.getNote)
+	v1.PUT("/notes/:id", h.updateNote)
+	v1.DELETE("/notes/:id", h.deleteNote)
+	v1.GET("/folders", h.listFolders)
 
 	return e
 }
@@ -84,6 +91,7 @@ func requestLogger(logger *slog.Logger) echo.MiddlewareFunc {
 
 type handler struct {
 	pinger Pinger
+	notes  *note.Service
 }
 
 func (h *handler) healthz(c echo.Context) error {
